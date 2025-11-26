@@ -2,15 +2,15 @@
 
 **Fork it, Port it, Done.**
 
-Local LLM을 활용하여 오픈소스 프로젝트를 다른 프로그래밍 언어로 1:1 포팅하는 CLI 도구입니다.
+A CLI tool that ports open source projects to different programming languages using local LLM.
 
 ## Features
 
-- 로컬 LLM (Ollama)을 사용한 코드 변환
-- 원본 폴더/클래스 구조 보존
-- 파일명 컨벤션 자동 변환 (camelCase → snake_case 등)
-- 진행률 및 예상 시간 표시
-- 다양한 언어 지원
+- Code conversion using local LLM (Ollama)
+- Preserves original folder/class structure
+- Automatic file naming convention conversion (e.g., camelCase → snake_case)
+- Progress tracking with ETA
+- Multi-language support
 
 ## Supported Languages
 
@@ -24,8 +24,8 @@ Local LLM을 활용하여 오픈소스 프로젝트를 다른 프로그래밍 �
 ## Requirements
 
 - Node.js 18+
-- [Ollama](https://ollama.ai) 실행 중
-- 코드 생성용 LLM 모델 (예: `codellama:7b`, `qwen2.5-coder`, `deepseek-coder`)
+- [Ollama](https://ollama.ai) running locally
+- Code generation LLM model (e.g., `codellama:7b`, `qwen2.5-coder`, `deepseek-coder`)
 
 ## Installation
 
@@ -36,35 +36,35 @@ npm run build
 
 ## Usage
 
-### 프로젝트 포팅
+### Port a project
 
 ```bash
-# 기본 사용법
+# Basic usage
 forky port <source-dir> <target-dir> -f <from-lang> -t <to-lang>
 
-# TypeScript → Dart 포팅
+# TypeScript → Dart
 forky port ./my-ts-project ./my-dart-project -f typescript -t dart
 
-# 특정 모델 지정
+# With specific model
 forky port ./src ./output -f typescript -t dart -m codellama:7b
 
-# Dry run (분석만)
+# Dry run (analyze only)
 forky port ./src ./output -f typescript -t dart --dry-run
 
-# 상세 출력
+# Verbose output
 forky port ./src ./output -f typescript -t dart -v
 ```
 
-### 프로젝트 분석
+### Analyze a project
 
 ```bash
 forky analyze <source-dir>
 
-# 파일 목록 포함
+# With file listing
 forky analyze ./my-project -v
 ```
 
-### 사용 가능한 모델 확인
+### List available models
 
 ```bash
 forky models
@@ -76,12 +76,12 @@ forky models
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-f, --from <lang>` | 소스 언어 | Required |
-| `-t, --to <lang>` | 타겟 언어 | Required |
-| `-m, --model <model>` | Ollama 모델 | `codellama` |
+| `-f, --from <lang>` | Source language | Required |
+| `-t, --to <lang>` | Target language | Required |
+| `-m, --model <model>` | Ollama model | `codellama` |
 | `--ollama-url <url>` | Ollama API URL | `http://localhost:11434` |
-| `--dry-run` | 포팅 없이 분석만 | `false` |
-| `-v, --verbose` | 상세 출력 | `false` |
+| `--dry-run` | Analyze without porting | `false` |
+| `-v, --verbose` | Verbose output | `false` |
 
 ## Example
 
@@ -105,16 +105,16 @@ Porting 209 files:
 ## Development
 
 ```bash
-# 개발 모드 실행
+# Run in development mode
 npm run dev -- <command>
 
-# 빌드
+# Build
 npm run build
 
-# 린트
+# Lint
 npm run lint
 
-# 테스트
+# Test
 npm test
 ```
 
