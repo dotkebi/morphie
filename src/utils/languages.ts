@@ -1,4 +1,4 @@
-export type FileType = 'source' | 'test' | 'config' | 'utility' | 'model' | 'service';
+export type FileType = 'source' | 'test' | 'config' | 'utility' | 'model' | 'service' | 'barrel';
 
 const languageExtensions: Record<string, string[]> = {
   python: ['.py'],

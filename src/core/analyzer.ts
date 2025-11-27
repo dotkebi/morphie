@@ -116,7 +116,12 @@ export class ProjectAnalyzer {
 
   private classifyFile(filePath: string): FileType {
     const lowerPath = filePath.toLowerCase();
+    const fileName = path.basename(lowerPath);
 
+    // Barrel files (re-export files)
+    if (fileName === 'index.ts' || fileName === 'index.js' || fileName === 'index.mjs') {
+      return 'barrel';
+    }
     if (lowerPath.includes('test') || lowerPath.includes('spec')) {
       return 'test';
     }

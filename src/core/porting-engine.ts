@@ -7,6 +7,7 @@ export interface PortedFile {
   targetPath: string;
   content: string;
   originalPath: string;
+  skipped?: boolean;
 }
 
 export class PortingEngine {
@@ -28,16 +29,95 @@ export class PortingEngine {
   }
 
   async portFile(file: SourceFile): Promise<PortedFile> {
+    const targetPath = this.convertFilePath(file.relativePath);
+
+    // Handle barrel files (index.ts) differently for Dart
+    if (file.type === 'barrel' && this.targetLanguage === 'dart') {
+      const dartExports = this.generateDartLibraryExport(file);
+      return {
+        targetPath,
+        content: dartExports,
+        originalPath: file.relativePath,
+      };
+    }
+
     const prompt = this.buildPortingPrompt(file);
     const response = await this.llm.generate(prompt);
     const portedContent = this.extractCode(response);
-    const targetPath = this.convertFilePath(file.relativePath);
 
     return {
       targetPath,
       content: portedContent,
       originalPath: file.relativePath,
     };
+  }
+
+  private generateDartLibraryExport(file: SourceFile): string {
+    const exports: string[] = [];
+    const content = file.content;
+
+    // Parse export statements from TypeScript/JavaScript
+    // export { Foo } from './foo';
+    // export * from './bar';
+    // export { default as Baz } from './baz';
+
+    const exportFromRegex = /export\s+(?:\{[^}]*\}|\*)\s+from\s+['"]([^'"]+)['"]/g;
+    const exportDefaultRegex = /export\s+\{\s*default\s+as\s+\w+\s*\}\s+from\s+['"]([^'"]+)['"]/g;
+
+    let match;
+    const seenPaths = new Set<string>();
+
+    // Match all export from statements
+    while ((match = exportFromRegex.exec(content)) !== null) {
+      const importPath = match[1];
+      if (!seenPaths.has(importPath)) {
+        seenPaths.add(importPath);
+        const dartPath = this.convertImportPath(importPath);
+        exports.push(`export '${dartPath}';`);
+      }
+    }
+
+    // If no exports found, create exports based on common patterns
+    if (exports.length === 0) {
+      // Try to find re-exports by looking for export keywords
+      const simpleExportRegex = /export\s+\{[^}]+\}\s+from\s+['"]\.\/([^'"]+)['"]/g;
+      while ((match = simpleExportRegex.exec(content)) !== null) {
+        const fileName = match[1];
+        const dartPath = this.convertImportPath(`./${fileName}`);
+        if (!seenPaths.has(dartPath)) {
+          seenPaths.add(dartPath);
+          exports.push(`export '${dartPath}';`);
+        }
+      }
+    }
+
+    // Generate library name from path
+    const dirName = path.dirname(file.relativePath);
+    const libraryName = dirName === '.'
+      ? 'main'
+      : dirName.replace(/[\/\\]/g, '_').replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+
+    let result = `/// Library exports for ${dirName || 'root'}\n`;
+    result += `library ${libraryName};\n\n`;
+    result += exports.join('\n');
+
+    return result || `// Empty barrel file - no exports found\nlibrary ${libraryName};\n`;
+  }
+
+  private convertImportPath(importPath: string): string {
+    // Remove ./ prefix if present
+    let dartPath = importPath.replace(/^\.\//, '');
+
+    // Remove file extension
+    dartPath = dartPath.replace(/\.(ts|js|tsx|jsx)$/, '');
+
+    // Convert camelCase to snake_case
+    dartPath = dartPath.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+
+    // Add .dart extension
+    dartPath = dartPath + '.dart';
+
+    return dartPath;
   }
 
   private buildPortingPrompt(file: SourceFile): string {
