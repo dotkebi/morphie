@@ -1,9 +1,11 @@
 import chalk from 'chalk';
 import ora from 'ora';
+import path from 'path';
 import { ProjectAnalyzer } from '../core/analyzer.js';
 import { PortingEngine } from '../core/porting-engine.js';
 import { OllamaClient } from '../llm/ollama.js';
 import { FileSystem } from '../utils/filesystem.js';
+import { generateProjectFiles } from '../utils/project-config.js';
 
 function formatTime(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -79,8 +81,12 @@ export async function portProject(
     await fs.ensureDirectory(target);
 
     // Port the project
-    spinner.text = 'Porting project...';
-    const engine = new PortingEngine(llm, options.from, options.to, options.verbose);
+    spinner.text = 'Building import mapping...';
+    const projectName = path.basename(target);
+    const engine = new PortingEngine(llm, options.from, options.to, options.verbose, projectName);
+
+    // Build import mapping before porting
+    engine.buildImportMapping(analysis.files);
 
     spinner.stop();
 
@@ -123,6 +129,25 @@ export async function portProject(
     }
 
     const totalTime = Math.round((Date.now() - startTime) / 1000);
+
+    // Generate project files (config, .gitignore, README.md)
+    const projectFiles = generateProjectFiles(options.to, projectName, options.from);
+
+    const generatedFiles: string[] = [];
+
+    if (projectFiles.config) {
+      await fs.writeFile(`${target}/${projectFiles.config.filename}`, projectFiles.config.content);
+      generatedFiles.push(projectFiles.config.filename);
+    }
+
+    await fs.writeFile(`${target}/${projectFiles.gitignore.filename}`, projectFiles.gitignore.content);
+    generatedFiles.push(projectFiles.gitignore.filename);
+
+    await fs.writeFile(`${target}/${projectFiles.readme.filename}`, projectFiles.readme.content);
+    generatedFiles.push(projectFiles.readme.filename);
+
+    console.log(chalk.cyan(`\n📦 Generated: ${generatedFiles.join(', ')}`));
+
     console.log(chalk.green(`\n✅ Porting completed in ${formatTime(totalTime)}!`));
     console.log(`  Success: ${chalk.green(successCount)}`);
     console.log(`  Failed: ${chalk.red(failCount)}`);

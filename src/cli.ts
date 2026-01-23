@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
-import chalk from 'chalk';
 import { portProject } from './commands/port.js';
 import { analyzeProject } from './commands/analyze.js';
 import { listModels } from './commands/models.js';
@@ -20,7 +19,7 @@ program
   .argument('<target>', 'Target output directory')
   .requiredOption('-f, --from <language>', 'Source language (e.g., python, javascript, go)')
   .requiredOption('-t, --to <language>', 'Target language (e.g., rust, typescript, java)')
-  .option('-m, --model <model>', 'LLM model to use (default: codellama)', 'codellama')
+  .option('-m, --model <model>', 'LLM model to use (default: codellama:7b)', 'codellama:7b')
   .option('--ollama-url <url>', 'Ollama API URL', 'http://localhost:11434')
   .option('--dry-run', 'Analyze without actually porting')
   .option('-v, --verbose', 'Verbose output')

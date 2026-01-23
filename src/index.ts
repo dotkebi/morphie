@@ -18,3 +18,6 @@ export {
   getSupportedLanguages,
 } from './utils/languages.js';
 export type { FileType } from './utils/languages.js';
+
+export { generateProjectConfig, generateProjectFiles } from './utils/project-config.js';
+export type { ProjectConfigFile, ProjectFiles } from './utils/project-config.js';

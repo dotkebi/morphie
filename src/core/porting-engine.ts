@@ -1,7 +1,25 @@
 import { OllamaClient } from '../llm/ollama.js';
-import { SourceFile } from './analyzer.js';
+import { SourceFile, ExportedSymbol } from './analyzer.js';
 import { getTargetExtension, getLanguageFeatures } from '../utils/languages.js';
 import path from 'path';
+
+export interface SymbolLocation {
+  filePath: string;
+  symbol: ExportedSymbol;
+}
+
+export interface ImportMapping {
+  /** Maps symbol name to file path (for simple lookups) */
+  symbolToFile: Map<string, string>;
+  /** Maps qualified name (e.g., "Stave.Position") to location */
+  qualifiedNameToLocation: Map<string, SymbolLocation>;
+  /** Maps file path to its exported symbols */
+  fileToSymbols: Map<string, ExportedSymbol[]>;
+  /** Maps simple name to all locations (for disambiguation) */
+  simpleNameToLocations: Map<string, SymbolLocation[]>;
+  /** Maps source relative path to target path (for import resolution) */
+  sourcePathToTargetPath: Map<string, string>;
+}
 
 export interface PortedFile {
   targetPath: string;
@@ -15,17 +33,62 @@ export class PortingEngine {
   private sourceLanguage: string;
   private targetLanguage: string;
   private verbose: boolean;
+  private projectName: string;
+  private importMapping: ImportMapping;
 
   constructor(
     llm: OllamaClient,
     sourceLanguage: string,
     targetLanguage: string,
-    verbose = false
+    verbose = false,
+    projectName = 'project'
   ) {
     this.llm = llm;
     this.sourceLanguage = sourceLanguage;
     this.targetLanguage = targetLanguage;
     this.verbose = verbose;
+    this.projectName = this.toSnakeCase(projectName);
+    this.importMapping = {
+      symbolToFile: new Map(),
+      qualifiedNameToLocation: new Map(),
+      fileToSymbols: new Map(),
+      simpleNameToLocations: new Map(),
+      sourcePathToTargetPath: new Map(),
+    };
+  }
+
+  buildImportMapping(files: SourceFile[]): void {
+    for (const file of files) {
+      const targetPath = this.convertFilePath(file.relativePath);
+
+      // Map source path to target path for import resolution
+      this.importMapping.sourcePathToTargetPath.set(file.relativePath, targetPath);
+
+      this.importMapping.fileToSymbols.set(targetPath, file.exports);
+
+      for (const symbol of file.exports) {
+        const location: SymbolLocation = { filePath: targetPath, symbol };
+
+        // Map by qualified name (unique)
+        this.importMapping.qualifiedNameToLocation.set(symbol.qualifiedName, location);
+
+        // Map by simple name (may have duplicates)
+        this.importMapping.symbolToFile.set(symbol.name, targetPath);
+
+        // Track all locations for a simple name (for disambiguation)
+        if (!this.importMapping.simpleNameToLocations.has(symbol.name)) {
+          this.importMapping.simpleNameToLocations.set(symbol.name, []);
+        }
+        this.importMapping.simpleNameToLocations.get(symbol.name)!.push(location);
+      }
+    }
+  }
+
+  private toSnakeCase(str: string): string {
+    return str
+      .replace(/([a-z])([A-Z])/g, '$1_$2')
+      .replace(/[-\s]/g, '_')
+      .toLowerCase();
   }
 
   async portFile(file: SourceFile): Promise<PortedFile> {
@@ -43,13 +106,79 @@ export class PortingEngine {
 
     const prompt = this.buildPortingPrompt(file);
     const response = await this.llm.generate(prompt);
-    const portedContent = this.extractCode(response);
+
+    if (!response || response.trim() === '') {
+      throw new Error('Empty response from LLM');
+    }
+
+    let portedContent = this.extractCode(response);
+
+    if (!portedContent || portedContent.trim() === '') {
+      throw new Error('Failed to extract code from LLM response');
+    }
+
+    // Remove self-imports (import statements that reference the current file)
+    portedContent = this.removeSelfImports(portedContent, targetPath);
+    
+    // Remove imports that reference non-existent files
+    portedContent = this.removeInvalidImports(portedContent, targetPath);
+
+    // Verify that all exports are included
+    const missingExports = this.verifyExports(file, portedContent);
+    if (missingExports.length > 0 && this.verbose) {
+      console.warn(`⚠️  Warning: Missing exports in ${file.relativePath}: ${missingExports.join(', ')}`);
+    }
 
     return {
       targetPath,
       content: portedContent,
       originalPath: file.relativePath,
     };
+  }
+
+  /**
+   * Verifies that all exported symbols from the source file are present in the ported content
+   * Returns array of missing symbol names
+   */
+  private verifyExports(file: SourceFile, portedContent: string): string[] {
+    const missing: string[] = [];
+
+    for (const exportSymbol of file.exports) {
+      let symbolName = exportSymbol.name;
+      
+      // If it's a nested symbol, check for the flattened name (ParentChild)
+      if (exportSymbol.parentClass) {
+        symbolName = `${exportSymbol.parentClass}${exportSymbol.name}`;
+      }
+      
+      // Check if the symbol appears in the ported content
+      // For Dart, check for enum, class, typedef definitions
+      let found = false;
+
+      if (exportSymbol.type === 'enum') {
+        // Check for enum definition
+        const enumPattern = new RegExp(`enum\\s+${this.escapeRegex(symbolName)}\\s*[\\{;]`, 'i');
+        found = enumPattern.test(portedContent);
+      } else if (exportSymbol.type === 'interface' || exportSymbol.type === 'type') {
+        // Check for class or typedef definition
+        const classPattern = new RegExp(`class\\s+${this.escapeRegex(symbolName)}\\s*[\\{;]`, 'i');
+        const typedefPattern = new RegExp(`typedef\\s+${this.escapeRegex(symbolName)}\\s*=`, 'i');
+        found = classPattern.test(portedContent) || typedefPattern.test(portedContent);
+      } else if (exportSymbol.type === 'class') {
+        // Check for class definition
+        const classPattern = new RegExp(`class\\s+${this.escapeRegex(symbolName)}\\s*[\\{;]`, 'i');
+        found = classPattern.test(portedContent);
+      } else {
+        // For functions, const, etc., just check if name appears
+        found = portedContent.includes(symbolName);
+      }
+
+      if (!found) {
+        missing.push(`${symbolName} (${exportSymbol.type})`);
+      }
+    }
+
+    return missing;
   }
 
   private generateDartLibraryExport(file: SourceFile): string {
@@ -62,7 +191,6 @@ export class PortingEngine {
     // export { default as Baz } from './baz';
 
     const exportFromRegex = /export\s+(?:\{[^}]*\}|\*)\s+from\s+['"]([^'"]+)['"]/g;
-    const exportDefaultRegex = /export\s+\{\s*default\s+as\s+\w+\s*\}\s+from\s+['"]([^'"]+)['"]/g;
 
     let match;
     const seenPaths = new Set<string>();
@@ -95,7 +223,7 @@ export class PortingEngine {
     const dirName = path.dirname(file.relativePath);
     const libraryName = dirName === '.'
       ? 'main'
-      : dirName.replace(/[\/\\]/g, '_').replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+      : dirName.replace(/[/\\]/g, '_').replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
 
     let result = `/// Library exports for ${dirName || 'root'}\n`;
     result += `library ${libraryName};\n\n`;
@@ -120,18 +248,335 @@ export class PortingEngine {
     return dartPath;
   }
 
+  /**
+   * Resolves an import path from source file to target file path
+   * Uses the sourcePathToTargetPath mapping to find the actual target path
+   * Returns null if the import path resolves to the same file (self-import)
+   */
+  private resolveImportPath(importPath: string, fromSourcePath: string): string | null {
+    // Normalize the import path relative to the source file
+    const sourceDir = path.dirname(fromSourcePath);
+    let resolvedSourcePath = path.normalize(
+      path.join(sourceDir, importPath)
+    ).replace(/\\/g, '/');
+
+    // Check if this resolves to the same file (self-import) - should not happen
+    const fromSourceWithoutExt = fromSourcePath.replace(/\.(ts|js|tsx|jsx)$/, '');
+    const resolvedWithoutExt = resolvedSourcePath.replace(/\.(ts|js|tsx|jsx)$/, '');
+    
+    // Prevent self-import
+    if (resolvedWithoutExt === fromSourceWithoutExt || 
+        resolvedSourcePath === fromSourcePath) {
+      return null; // Self-import detected
+    }
+
+    // Strategy 1: Try exact match first (with extension)
+    if (this.importMapping.sourcePathToTargetPath.has(resolvedSourcePath)) {
+      return this.importMapping.sourcePathToTargetPath.get(resolvedSourcePath)!;
+    }
+
+    // Strategy 2: Try without extension (match by base path)
+    for (const [sourcePath, targetPath] of this.importMapping.sourcePathToTargetPath) {
+      const sourceWithoutExt = sourcePath.replace(/\.(ts|js|tsx|jsx)$/, '');
+      if (sourceWithoutExt === resolvedWithoutExt) {
+        return targetPath;
+      }
+    }
+
+    // Strategy 3: Try index file in directory (barrel files)
+    const indexPaths = [
+      resolvedWithoutExt + '/index.ts',
+      resolvedWithoutExt + '/index.js',
+      resolvedWithoutExt + '/index.tsx',
+      resolvedWithoutExt + '/index.jsx',
+    ];
+
+    for (const indexPath of indexPaths) {
+      if (this.importMapping.sourcePathToTargetPath.has(indexPath)) {
+        return this.importMapping.sourcePathToTargetPath.get(indexPath)!;
+      }
+    }
+
+    // Strategy 4: Try directory match (for barrel files)
+    // If import points to a directory, find index file in that directory
+    for (const [sourcePath, targetPath] of this.importMapping.sourcePathToTargetPath) {
+      const sourcePathDir = path.dirname(sourcePath).replace(/\\/g, '/');
+      const sourcePathBase = path.basename(sourcePath, path.extname(sourcePath));
+      
+      // Check if the directory matches and it's an index file
+      if (sourcePathDir === resolvedWithoutExt && 
+          (sourcePathBase === 'index' || sourcePathBase === resolvedWithoutExt.split('/').pop())) {
+        return targetPath;
+      }
+    }
+
+    // Strategy 5: Try partial match (for nested imports)
+    // e.g., if import is './foo' and we have './foo/bar.ts', try to find './foo/index.ts'
+    const resolvedDir = resolvedWithoutExt;
+    for (const [sourcePath, targetPath] of this.importMapping.sourcePathToTargetPath) {
+      const sourcePathDir = path.dirname(sourcePath).replace(/\\/g, '/');
+      if (sourcePathDir === resolvedDir) {
+        // Found a file in the target directory, check if there's an index
+        const targetDir = path.dirname(targetPath).replace(/\\/g, '/');
+        const possibleIndex = targetDir + '/index.dart';
+        if (this.importMapping.fileToSymbols.has(possibleIndex)) {
+          return possibleIndex;
+        }
+        // If no index, return the first file found (might not be ideal, but better than nothing)
+        if (this.verbose) {
+          console.warn(`Warning: No index file found for directory ${resolvedDir}, using ${targetPath}`);
+        }
+        return targetPath;
+      }
+    }
+
+    return null;
+  }
+
+  private buildImportContext(file: SourceFile): string {
+    if (this.targetLanguage !== 'dart') {
+      return '';
+    }
+
+    // Extract imports from the source file
+    const importRegex = /import\s+(?:\{[^}]+\}|\*\s+as\s+\w+|\w+)\s+from\s+['"]([^'"]+)['"]/g;
+    const imports: Array<{ path: string; symbols: string[] }> = [];
+    let match;
+
+    while ((match = importRegex.exec(file.content)) !== null) {
+      const importPath = match[1];
+      // Extract symbol names from import statement
+      const symbolMatch = match[0].match(/import\s+\{([^}]+)\}/);
+      const symbols = symbolMatch
+        ? symbolMatch[1].split(',').map(s => s.trim().split(' as ')[0].trim())
+        : [];
+      imports.push({ path: importPath, symbols });
+    }
+
+    if (imports.length === 0 && this.importMapping.symbolToFile.size === 0) {
+      return '';
+    }
+
+    const currentTargetPath = this.convertFilePath(file.relativePath);
+    const currentDir = path.dirname(currentTargetPath);
+
+    // Get symbols defined in the current file (should NOT be imported)
+    const currentFileSymbols = file.exports.map(s => s.name);
+    
+    // Group symbols by type for clearer checklist
+    const symbolsByType = {
+      enum: file.exports.filter(s => s.type === 'enum'),
+      interface: file.exports.filter(s => s.type === 'interface'),
+      type: file.exports.filter(s => s.type === 'type'),
+      class: file.exports.filter(s => s.type === 'class'),
+      function: file.exports.filter(s => s.type === 'function'),
+      const: file.exports.filter(s => s.type === 'const'),
+    };
+
+    const lines: string[] = [
+      '## Import Path Mapping (CRITICAL)',
+      `Package name: \`${this.projectName}\``,
+      `Current file: \`${currentTargetPath}\``,
+      '',
+      `### Symbols defined in THIS file (MUST be included in the output - DO NOT import these):`,
+      currentFileSymbols.length > 0 
+        ? `**MANDATORY exports to include: ${currentFileSymbols.join(', ')}**`
+        : '- None',
+      '',
+      `**CRITICAL**: The source file exports ${currentFileSymbols.length} symbol(s). You MUST include ALL of them in your output. Do NOT skip any enum, interface, type, or class definitions.`,
+      '',
+      `**MANDATORY CHECKLIST - Your output MUST include ALL of these**:
+      ${symbolsByType.enum.length > 0 ? `- Enums: ${symbolsByType.enum.map(s => s.name).join(', ')}` : ''}
+      ${symbolsByType.interface.length > 0 ? `- Interfaces (convert to class): ${symbolsByType.interface.map(s => s.name).join(', ')}` : ''}
+      ${symbolsByType.type.length > 0 ? `- Types (convert to typedef or class): ${symbolsByType.type.map(s => s.name).join(', ')}` : ''}
+      ${symbolsByType.class.length > 0 ? `- Classes: ${symbolsByType.class.map(s => s.name).join(', ')}` : ''}
+      ${symbolsByType.function.length > 0 ? `- Functions: ${symbolsByType.function.map(s => s.name).join(', ')}` : ''}
+      ${symbolsByType.const.length > 0 ? `- Constants: ${symbolsByType.const.map(s => s.name).join(', ')}` : ''}
+      ${currentFileSymbols.length === 0 ? '- None (but check for non-exported interfaces/types in the source code)' : ''}`,
+      '',
+      '### Import Rules:',
+      `1. Use package imports for files in different directories: \`import 'package:${this.projectName}/path/to/file.dart';\``,
+      `2. Use relative imports ONLY for files in the same directory: \`import 'file.dart';\``,
+      '3. File paths must use snake_case (e.g., `my_class.dart` not `MyClass.dart`)',
+      '4. NEVER invent package names or file names - only use paths that exist in the import mapping below',
+      '5. All enums, interfaces, and types defined in the source file MUST be included in the same target file',
+      '6. DO NOT create separate files for enums/types that are in the same source file',
+      '',
+    ];
+
+    // Build import mapping for symbols used in this file
+    if (imports.length > 0) {
+      lines.push('### Required imports for this file:');
+
+      for (const imp of imports) {
+        // Resolve import path using the mapping
+        const targetPath = this.resolveImportPath(imp.path, file.relativePath);
+
+        // Skip self-imports (should not happen, but filter just in case)
+        if (targetPath && targetPath === currentTargetPath) {
+          if (this.verbose) {
+            lines.push(`- \`${imp.path}\` → ⚠️  SKIPPED (self-import)`);
+          }
+          continue;
+        }
+
+        if (targetPath) {
+          // Use the actual target path from mapping
+          const importDir = path.dirname(targetPath).replace(/\\/g, '/');
+          const normalizedCurrentDir = currentDir.replace(/\\/g, '/');
+          
+          // Check if same directory for relative import
+          if (importDir === normalizedCurrentDir) {
+            lines.push(`- \`${imp.path}\` → \`import '${path.basename(targetPath)}';\``);
+          } else {
+            // Use forward slashes for package imports (Dart convention)
+            const packagePath = targetPath.replace(/\\/g, '/');
+            lines.push(`- \`${imp.path}\` → \`import 'package:${this.projectName}/${packagePath}';\``);
+          }
+        } else {
+          // Fallback: convert path manually if not found in mapping
+          // This should rarely happen, but provides a fallback
+          const resolvedSourcePath = path.normalize(
+            path.join(path.dirname(file.relativePath), imp.path)
+              .replace(/\.(ts|js|tsx|jsx)$/, '')
+          ).replace(/\\/g, '/');
+          
+          const dartPath = this.toSnakeCase(resolvedSourcePath) + '.dart';
+          const importDir = path.dirname(dartPath).replace(/\\/g, '/');
+          const normalizedCurrentDir = currentDir.replace(/\\/g, '/');
+          
+          if (importDir === normalizedCurrentDir) {
+            lines.push(`- \`${imp.path}\` → \`import '${path.basename(dartPath)}';\``);
+          } else {
+            lines.push(`- \`${imp.path}\` → \`import 'package:${this.projectName}/${dartPath}';\``);
+          }
+          
+          if (this.verbose) {
+            lines.push(`  ⚠️  Warning: Could not resolve import path "${imp.path}" - using fallback conversion`);
+          }
+        }
+      }
+      lines.push('');
+    }
+
+    // Find nested enums/types that need qualified access
+    const nestedTypes = this.findNestedTypesInFile(file);
+    if (nestedTypes.length > 0) {
+      lines.push('### Nested Types (IMPORTANT - EXTRACT to top-level):');
+      lines.push('These enums/types are defined INSIDE their parent class. Extract them to top-level and rename them:');
+      for (const nested of nestedTypes) {
+        lines.push(`- \`${nested.qualifiedName}\` → extract as \`${nested.parentClass}${nested.name}\` (Top-level)`);
+      }
+      lines.push('');
+    }
+
+    // Find symbols with multiple definitions (need disambiguation)
+    const ambiguousSymbols = this.findAmbiguousSymbols(file);
+    if (ambiguousSymbols.length > 0) {
+      lines.push('### Ambiguous Symbols (Multiple definitions exist):');
+      lines.push('These symbol names exist in multiple places. Use the CORRECT one based on context:');
+      for (const amb of ambiguousSymbols) {
+        lines.push(`- \`${amb.name}\`:`);
+        for (const loc of amb.locations) {
+          if (loc.symbol.parentClass) {
+            lines.push(`  - \`${loc.symbol.qualifiedName}\` in \`${loc.filePath}\` (nested in ${loc.symbol.parentClass})`);
+          } else {
+            lines.push(`  - \`${loc.symbol.qualifiedName}\` in \`${loc.filePath}\` (top-level)`);
+          }
+        }
+      }
+      lines.push('');
+    }
+
+    // Add symbol to file mapping for commonly used symbols
+    if (this.importMapping.qualifiedNameToLocation.size > 0) {
+      const relevantSymbols: string[] = [];
+      const symbolToImport = new Map<string, string>(); // Deduplicate by symbol name
+
+      // Find symbols that might be referenced in this file
+      for (const [qualifiedName, location] of this.importMapping.qualifiedNameToLocation) {
+        const { filePath, symbol } = location;
+        if (filePath === currentTargetPath) continue;
+
+        // Check if this symbol is used in the file (by name or qualified name)
+        const isUsed = file.content.includes(symbol.name) || 
+                       file.content.includes(qualifiedName) ||
+                       (symbol.parentClass && file.content.includes(`${symbol.parentClass}.${symbol.name}`));
+
+        if (isUsed) {
+          const importDir = path.dirname(filePath).replace(/\\/g, '/');
+          const normalizedCurrentDir = currentDir.replace(/\\/g, '/');
+          
+          // Determine import statement
+          let importStatement: string;
+          if (importDir === normalizedCurrentDir) {
+            importStatement = `import '${path.basename(filePath)}';`;
+          } else {
+            const packagePath = filePath.replace(/\\/g, '/');
+            importStatement = `import 'package:${this.projectName}/${packagePath}';`;
+          }
+
+          if (symbol.parentClass) {
+            // Nested type - show flattened access
+            const key = qualifiedName;
+            if (!symbolToImport.has(key)) {
+              symbolToImport.set(key, `- \`${qualifiedName}\` → ${importStatement} then use \`${symbol.parentClass}${symbol.name}\` (Top-level)`);
+            }
+          } else {
+            // Top-level symbol
+            const key = symbol.name;
+            if (!symbolToImport.has(key)) {
+              symbolToImport.set(key, `- \`${symbol.name}\` → ${importStatement}`);
+            }
+          }
+        }
+      }
+
+      if (symbolToImport.size > 0) {
+        lines.push('### Symbol locations (use these exact imports):');
+        lines.push('These symbols are referenced in the code. Use the exact import paths below:');
+        lines.push(...Array.from(symbolToImport.values()).slice(0, 40));
+        lines.push('');
+      }
+    }
+
+    return lines.join('\n');
+  }
+
+  private findNestedTypesInFile(file: SourceFile): ExportedSymbol[] {
+    const currentTargetPath = this.convertFilePath(file.relativePath);
+    const symbols = this.importMapping.fileToSymbols.get(currentTargetPath) || [];
+    return symbols.filter(s => s.parentClass);
+  }
+
+  private findAmbiguousSymbols(file: SourceFile): Array<{ name: string; locations: SymbolLocation[] }> {
+    const result: Array<{ name: string; locations: SymbolLocation[] }> = [];
+
+    for (const [name, locations] of this.importMapping.simpleNameToLocations) {
+      // Only include if there are multiple definitions AND the symbol is used in this file
+      if (locations.length > 1 && file.content.includes(name)) {
+        result.push({ name, locations });
+      }
+    }
+
+    return result.slice(0, 10); // Limit to avoid too long prompts
+  }
+
   private buildPortingPrompt(file: SourceFile): string {
     const sourceFeatures = getLanguageFeatures(this.sourceLanguage);
     const targetFeatures = getLanguageFeatures(this.targetLanguage);
+    const importContext = this.buildImportContext(file);
 
     return `You are an expert software engineer performing a 1:1 code port from ${this.sourceLanguage} to ${this.targetLanguage}.
 
 ## Task
 Convert the following ${this.sourceLanguage} code to idiomatic ${this.targetLanguage} code while preserving:
 - Exact functionality and behavior
-- Code structure and organization
+- Code structure and organization (if a method is inside a class, keep it inside the class - do NOT extract methods as top-level functions)
 - Function/method signatures (adapted to target language conventions)
 - Comments and documentation (translated appropriately)
+- **CRITICAL: Include ALL methods, including private methods** - If the source has \`private addListener(...)\`, you MUST include the converted private method in the output. Do NOT skip private methods.
+- **CRITICAL: Do NOT add organizational comments** - Do NOT add comments like "// Ported from ...", "// Enums", "// Interfaces/Types", "// Classes", "// Functions", etc. Just write the code directly without section dividers.
 
 ## Source Language Features
 ${sourceFeatures}
@@ -146,6 +591,215 @@ ${targetFeatures}
 4. Preserve any TODO comments or notes
 5. Use idiomatic patterns for the target language
 6. Include necessary imports/dependencies
+7. **CRITICAL: NEVER import the current file itself** - Do not add import statements that reference the file you are currently porting
+8. **CRITICAL: Keep all definitions in the same file** - If enums, interfaces, or types are defined in the source file alongside classes, they MUST be included in the same target file. Do NOT create separate files or import statements for symbols that are defined in the current file.
+9. **CRITICAL: Include non-exported interfaces/types** - Even if an interface or type is NOT exported (e.g., \`interface EventListener\`), if it is used in the file, it MUST be included in the output
+10. **CRITICAL: Do NOT convert string types to enums** - If a TypeScript type is \`string\`, keep it as \`String\` in Dart. Do NOT create enums for string values unless the source code explicitly uses an enum type
+11. **CRITICAL: Type aliases are NOT enums** - \`export type\` in TypeScript should become \`typedef\` (for functions) or \`class\` (for objects) in Dart. NEVER convert \`type\` to \`enum\`
+12. **CRITICAL: Include ALL methods, including private methods** - If a class has \`private addListener(...)\` in TypeScript, you MUST include it as \`void _addListener(...)\` in Dart (Dart uses underscore prefix for private). Do NOT skip any methods, whether public or private.
+
+${importContext}
+
+## TypeScript to Dart Enum Conversion
+When converting TypeScript enums with explicit values to Dart, use enhanced enums.
+
+**IMPORTANT**: The examples below are for REFERENCE ONLY. Do NOT include these example comments or code in your output. Only generate the actual ported code for the source file provided.
+
+### Numeric Enum Values
+For TypeScript \`enum Position { LEFT = 1, RIGHT = 2, ABOVE = 3 }\`, convert to:
+\`\`\`dart
+enum Position {
+  left(1),
+  right(2),
+  above(3);
+
+  final int value;
+  const Position(this.value);
+}
+\`\`\`
+
+### String Enum Values (CRITICAL)
+For TypeScript string enums like \`enum Operation { ADD = 'add', SUBTRACT = 'subtract' }\`, convert to:
+\`\`\`dart
+enum Operation {
+  add('add'),
+  subtract('subtract');
+
+  final String value;
+  const Operation(this.value);
+}
+\`\`\`
+
+**Conversion Rules**: 
+- Dart enum values must be lowercase (Dart naming convention)
+- String enum values require a \`final String value\` field and constructor
+- The enum name itself remains PascalCase, but values are camelCase/lowercase
+- Usage: \`Operation.add.value\` returns \`'add'\`, \`Operation.add\` is the enum instance
+- **DO NOT include example comments like "// TypeScript - string enum" in your output**
+
+## Nested Enums/Types (CRITICAL)
+When TypeScript has static enums/objects INSIDE a class, convert them to **TOP-LEVEL** enums/classes.
+
+For TypeScript \`class Stave { static Position = { ABOVE: 0, BELOW: 1 }; }\`, convert to:
+\`\`\`dart
+class Stave {
+  // Class implementation
+}
+
+// EXTRACTED to top-level
+enum StavePosition {
+  above(0),
+  below(1);
+
+  final int value;
+  const StavePosition(this.value);
+}
+\`\`\`
+
+**IMPORTANT**: 
+- **DO NOT** keep enums nested inside classes. Dart supports nested classes but it's better to keep them top-level for cleaner imports.
+- Rename the extracted enum by prefixing the parent class name (e.g., \`Stave.Position\` → \`StavePosition\`, \`Modifier.Position\` → \`ModifierPosition\`).
+- **DO NOT** create duplicate top-level enums with the same name.
+- **DO NOT** include example comments or TypeScript code in your output.
+
+## TypeScript Interface to Dart Conversion
+TypeScript interfaces must be converted to Dart classes. Dart does not have interfaces, but all classes are implicit interfaces.
+
+For TypeScript \`interface CalculationResult { operation: Operation; operands: number[]; result: number; timestamp: Date; }\`, convert to:
+\`\`\`dart
+class CalculationResult {
+  final Operation operation;
+  final List<num> operands;
+  final num result;
+  final DateTime timestamp;
+
+  const CalculationResult(this.operation, this.operands, this.result, this.timestamp);
+}
+\`\`\`
+
+For TypeScript \`interface ShapeMetadata { name: string; color?: string; createdAt: Date; }\`, convert to:
+\`\`\`dart
+class ShapeMetadata {
+  final String name;
+  final String? color;
+  final DateTime createdAt;
+
+  const ShapeMetadata({required this.name, this.color, required this.createdAt});
+}
+\`\`\`
+
+**Conversion Rules**:
+- TypeScript \`interface\` → Dart \`class\` (Dart does not have interfaces, all classes are implicit interfaces)
+- **CRITICAL: Include ALL interfaces, even if they are NOT exported** - If an interface is used in the file (even if not exported like \`interface EventListener\`), it MUST be included in the output as a class
+- **MANDATORY: Every interface in the source code MUST appear in the output** - Check the source code carefully for ALL interface definitions, both exported and non-exported
+- **Example**: If source has \`interface EventListener { callback: EventCallback; once: boolean; }\`, you MUST include:
+  \`\`\`dart
+  class EventListener {
+    final EventCallback callback;
+    final bool once;
+    
+    const EventListener({required this.callback, required this.once});
+  }
+  \`\`\`
+- Optional properties (\`color?: string\`) → Nullable types (\`String? color\`)
+- Use named parameters for constructors when appropriate
+- Use \`required\` keyword for non-nullable required fields
+- All interface definitions MUST be included in the output (both exported and non-exported)
+
+## TypeScript Type Alias to Dart Conversion
+TypeScript type aliases must be converted to Dart typedefs or classes depending on the type.
+
+**CRITICAL: Type aliases are NEVER enums. NEVER use enum for type aliases.**
+
+For function type aliases like \`export type EventCallback<T = unknown> = (data: T) => void;\`, convert to:
+\`\`\`dart
+typedef EventCallback<T> = void Function(T data);
+\`\`\`
+
+**WRONG - DO NOT DO THIS**:
+\`\`\`dart
+// WRONG - Type aliases are NOT enums!
+enum EventCallback<T> { ... }  // NEVER DO THIS
+\`\`\`
+
+For object type aliases like \`export type TaskFilter = { status?: TaskStatus; priority?: TaskPriority; tag?: string; };\`, convert to:
+\`\`\`dart
+class TaskFilter {
+  final TaskStatus? status;
+  final TaskPriority? priority;
+  final String? tag;
+
+  const TaskFilter({this.status, this.priority, this.tag});
+}
+\`\`\`
+
+**Conversion Rules**:
+- **Function type aliases → \`typedef\` ONLY** - \`export type EventCallback<T> = (data: T) => void;\` becomes \`typedef EventCallback<T> = void Function(T data);\`
+- **Object type aliases → \`class\` ONLY** - Object types become classes with nullable optional fields
+- **CRITICAL: Type aliases are NEVER enums** - Do NOT convert \`type\` to \`enum\`. Type aliases are either \`typedef\` (for functions) or \`class\` (for objects)
+- **NEVER use enum syntax for type aliases** - If you see \`export type\`, it is ALWAYS either \`typedef\` or \`class\`, NEVER \`enum\`
+- **WRONG EXAMPLE**: \`enum EventCallback<T> { void Function(T data); }\` is COMPLETELY WRONG. The correct conversion is \`typedef EventCallback<T> = void Function(T data);\`
+- All type definitions MUST be included in the output
+
+## Dart Reserved Keywords
+These TypeScript identifiers must be renamed in Dart (they are reserved keywords):
+- \`default\` → \`defaultValue\` or \`defaults\`
+- \`class\` → \`clazz\` or \`className\`
+- \`new\` → \`create\` or \`newInstance\`
+- \`switch\` → \`switchCase\`
+- \`case\` → \`caseValue\`
+- \`in\` → \`inValue\`
+- \`is\` → \`isValue\`
+- \`abstract\` → \`abstractValue\`
+- \`as\` → \`asValue\`
+- \`assert\` → \`assertValue\`
+- \`async\` → \`asyncValue\`
+- \`await\` → \`awaitValue\`
+- \`break\` → \`breakValue\`
+- \`catch\` → \`catchValue\`
+- \`const\` → \`constValue\`
+- \`continue\` → \`continueValue\`
+- \`do\` → \`doValue\`
+- \`else\` → \`elseValue\`
+- \`enum\` → \`enumValue\`
+- \`extends\` → \`extendsValue\`
+- \`extension\` → \`extensionValue\`
+- \`external\` → \`externalValue\`
+- \`factory\` → \`factoryValue\`
+- \`false\` → \`falseValue\`
+- \`final\` → \`finalValue\`
+- \`finally\` → \`finallyValue\`
+- \`for\` → \`forValue\`
+- \`Function\` → \`FunctionType\` or \`Func\`
+- \`get\` → \`getValue\`
+- \`if\` → \`ifValue\`
+- \`implements\` → \`implementsValue\`
+- \`import\` → \`importValue\`
+- \`interface\` → \`interfaceValue\`
+- \`late\` → \`lateValue\`
+- \`library\` → \`libraryValue\`
+- \`mixin\` → \`mixinValue\`
+- \`null\` → \`nullValue\`
+- \`on\` → \`onValue\`
+- \`operator\` → \`operatorValue\`
+- \`part\` → \`partValue\`
+- \`required\` → \`requiredValue\`
+- \`rethrow\` → \`rethrowValue\`
+- \`return\` → \`returnValue\`
+- \`set\` → \`setValue\`
+- \`static\` → \`staticValue\`
+- \`super\` → \`superValue\`
+- \`sync\` → \`syncValue\`
+- \`this\` → \`thisValue\`
+- \`throw\` → \`throwValue\`
+- \`true\` → \`trueValue\`
+- \`try\` → \`tryValue\`
+- \`typedef\` → \`typedefValue\`
+- \`var\` → \`varValue\`
+- \`void\` → \`voidValue\`
+- \`while\` → \`whileValue\`
+- \`with\` → \`withValue\`
+- \`yield\` → \`yieldValue\`
 
 ## Source Code (${file.relativePath})
 \`\`\`${this.sourceLanguage}
@@ -153,7 +807,53 @@ ${file.content}
 \`\`\`
 
 ## Ported Code
-Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block. Do not include explanations.`;
+Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block. 
+
+**BEFORE YOU START - ANALYZE THE SOURCE CODE**:
+1. Read the source code above carefully
+2. **MANDATORY: Create a checklist** - Write down (mentally or on paper) ALL definitions you find:
+   - Every \`export enum\` statement → must become a Dart enum
+   - Every \`export interface\` statement → must become a Dart class
+   - Every \`export type\` statement → must become a Dart typedef or class
+   - Every \`interface\` statement (even if NOT exported) → must become a Dart class
+   - Every \`export class\` statement → must become a Dart class
+   - Every method in classes (both public and private) → must be included
+3. **Before submitting your answer, verify** - Check that EVERY item from your checklist appears in your output. If you find any missing, add them before submitting.
+
+**CRITICAL REQUIREMENTS - YOU MUST INCLUDE ALL DEFINITIONS**:
+1. **MANDATORY: Include ALL exports from the source file**:
+   - If the source file has \`export enum\`, you MUST include the converted enum
+   - If the source file has \`export interface\`, you MUST include the converted class (Dart does not have interfaces, convert to class)
+   - If the source file has \`export type\`, you MUST include the converted typedef (for functions) or class (for objects) - **NEVER convert type to enum**
+   - If the source file has \`export class\`, you MUST include the converted class
+   - If the source file has \`export function\`, you MUST include the converted function
+   - **DO NOT skip any exported definitions**
+   - **CRITICAL: Even non-exported interfaces/types used in the file MUST be included** (e.g., \`interface EventListener\` even if not exported)
+   - **CRITICAL: Include ALL methods in classes, including private methods** - If a class has \`private addListener(...)\`, you MUST include it as \`void _addListener(...)\` in Dart. Do NOT skip private methods.
+   - **VERIFICATION STEP**: Before finishing, count all \`interface\`, \`type\`, \`enum\`, \`class\` definitions AND all methods (including private) in the source code. Make sure ALL of them appear in your output.
+   - **CRITICAL CHECKLIST - Your output MUST include ALL of these**:
+     * ✅ All \`export enum\` statements → converted to Dart enum
+     * ✅ All \`export interface\` statements → converted to Dart class
+     * ✅ All \`export type\` statements → converted to Dart typedef (for functions) or class (for objects)
+     * ✅ All \`interface\` statements (even non-exported) → converted to Dart class
+     * ✅ All \`export class\` statements → converted to Dart class with ALL methods (public AND private)
+   - **DO NOT prioritize methods over definitions** - Include BOTH all definitions (enum, interface, type, class) AND all methods. They are equally important.
+
+2. **Code Quality**:
+   - Do NOT include any example code or comments from the instructions above
+   - Do NOT include comments like "// TypeScript - ..." or "// Dart - ..."
+   - Do NOT include comments like "// Ported from ..." or "// Enums" or "// Interfaces/Types" or "// Classes" or "// Functions"
+   - Do NOT add section dividers or organizational comments - just write the code directly
+   - Do NOT include reference examples - only generate the actual ported code for the source file
+   - Include only the actual ported code with appropriate comments for the code itself (if needed)
+   - Do not include explanations or example code blocks
+   - **CRITICAL: Maintain the exact structure from source** - If methods are inside a class in the source, they MUST be inside the class in the output. Do NOT extract class methods as top-level functions.
+
+3. **Order of Definitions** (apply naturally, do NOT add section comments):
+   - Enums first (if any) - but NO "// Enums" comment
+   - Interfaces/Types next (if any) - but NO "// Interfaces/Types" comment
+   - Classes last - but NO "// Classes" comment
+   - Functions only if they are top-level exports (not class methods) - but NO "// Functions" comment`;
   }
 
   private extractCode(response: string): string {
@@ -168,6 +868,118 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
 
     // If no code blocks, return the response as-is (trimmed)
     return response.trim();
+  }
+
+  /**
+   * Removes self-import statements from the ported code
+   * Self-imports are import statements that reference the current file itself
+   */
+  private removeSelfImports(content: string, currentFilePath: string): string {
+    // Get the base name of the current file (e.g., "calculator.dart" from "src/calculator.dart")
+    const currentFileName = path.basename(currentFilePath);
+    const currentFileNameWithoutExt = path.basename(currentFilePath, path.extname(currentFilePath));
+    
+    // Normalize current file path for comparison (remove leading slash, use forward slashes)
+    const normalizedCurrentPath = currentFilePath.replace(/\\/g, '/').replace(/^\//, '');
+    
+    // Patterns to match self-imports
+    const selfImportPatterns = [
+      // Match: import 'package:.../current_file.dart';
+      new RegExp(`import\\s+['"]package:[^'"]*${this.escapeRegex(currentFileName)}['"];?\\s*\\n?`, 'g'),
+      // Match: import 'package:.../current_file';
+      new RegExp(`import\\s+['"]package:[^'"]*${this.escapeRegex(currentFileNameWithoutExt)}['"];?\\s*\\n?`, 'g'),
+      // Match: import 'current_file.dart';
+      new RegExp(`import\\s+['"]${this.escapeRegex(currentFileName)}['"];?\\s*\\n?`, 'g'),
+      // Match: import 'current_file';
+      new RegExp(`import\\s+['"]${this.escapeRegex(currentFileNameWithoutExt)}['"];?\\s*\\n?`, 'g'),
+      // Match: import 'package:.../exact/path/to/current_file.dart';
+      new RegExp(`import\\s+['"]package:[^'"]*${this.escapeRegex(normalizedCurrentPath)}['"];?\\s*\\n?`, 'g'),
+    ];
+
+    let cleanedContent = content;
+    for (const pattern of selfImportPatterns) {
+      cleanedContent = cleanedContent.replace(pattern, '');
+    }
+
+    return cleanedContent.trim();
+  }
+
+  private escapeRegex(str: string): string {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /**
+   * Removes import statements that reference files that don't exist in the target project
+   * This prevents imports like 'package:ts_sample_dart/enums.dart' when enums.dart doesn't exist
+   */
+  private removeInvalidImports(content: string, currentFilePath: string): string {
+    // Get all valid target file paths from the mapping
+    const validTargetPaths = new Set<string>();
+    for (const targetPath of this.importMapping.sourcePathToTargetPath.values()) {
+      validTargetPaths.add(targetPath.replace(/\\/g, '/'));
+      // Also add basename for relative imports
+      validTargetPaths.add(path.basename(targetPath));
+    }
+
+    // Match all import statements
+    const importRegex = /import\s+['"]([^'"]+)['"];?\s*\n?/g;
+    let cleanedContent = content;
+    const matches: Array<{ fullMatch: string; importPath: string }> = [];
+    let match;
+
+    // Collect all matches first
+    while ((match = importRegex.exec(content)) !== null) {
+      matches.push({ fullMatch: match[0], importPath: match[1] });
+    }
+
+    // Check and remove invalid imports
+    for (const { fullMatch, importPath } of matches) {
+      let isValid = false;
+
+      // For package imports, extract the file path
+      if (importPath.startsWith('package:')) {
+        const packageMatch = importPath.match(/package:[^/]+\/(.+)/);
+        if (packageMatch) {
+          const filePath = packageMatch[1].replace(/\\/g, '/');
+          
+          // Check if this file exists in our mapping
+          for (const targetPath of validTargetPaths) {
+            const normalizedTarget = targetPath.replace(/\\/g, '/');
+            if (normalizedTarget === filePath || 
+                normalizedTarget.endsWith('/' + filePath) ||
+                normalizedTarget === filePath.replace(/\.dart$/, '') + '.dart') {
+              isValid = true;
+              break;
+            }
+          }
+        }
+      } else {
+        // Relative import - check if resolved path exists
+        const currentDir = path.dirname(currentFilePath).replace(/\\/g, '/');
+        const resolvedPath = path.normalize(
+          path.join(currentDir, importPath)
+        ).replace(/\\/g, '/');
+        
+        for (const targetPath of validTargetPaths) {
+          const normalizedTarget = targetPath.replace(/\\/g, '/');
+          if (normalizedTarget === resolvedPath || 
+              normalizedTarget.endsWith('/' + path.basename(importPath))) {
+            isValid = true;
+            break;
+          }
+        }
+      }
+
+      if (!isValid) {
+        // Remove invalid import
+        cleanedContent = cleanedContent.replace(fullMatch, '');
+        if (this.verbose) {
+          console.warn(`Removed invalid import: ${importPath} (file does not exist in target project)`);
+        }
+      }
+    }
+
+    return cleanedContent.trim();
   }
 
   private convertFilePath(sourcePath: string): string {

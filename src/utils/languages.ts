@@ -158,7 +158,8 @@ export function getLanguageFeatures(language: string): string {
 - async/await and Future/Stream for async
 - Named and positional parameters
 - Extension methods
-- Factory constructors`,
+- Factory constructors
+- Enhanced enums: enums with custom values, methods, and fields`,
   };
 
   return features[language] || '- Standard language features';

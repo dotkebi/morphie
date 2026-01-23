@@ -8,6 +8,17 @@ export interface SourceFile {
   relativePath: string;
   content: string;
   type: FileType;
+  exports: ExportedSymbol[];
+}
+
+export interface ExportedSymbol {
+  name: string;
+  type: 'class' | 'function' | 'interface' | 'type' | 'enum' | 'const' | 'variable';
+  isDefault: boolean;
+  /** Parent class/namespace if this is a nested type (e.g., "Stave" for "Stave.Position") */
+  parentClass?: string;
+  /** Fully qualified name including parent (e.g., "Stave.Position" or "Position") */
+  qualifiedName: string;
 }
 
 export interface ProjectAnalysis {
@@ -101,17 +112,184 @@ export class ProjectAnalyzer {
         const absolutePath = path.join(this.sourcePath, match);
         const content = await this.fs.readFile(absolutePath);
         const type = this.classifyFile(match);
+        const exports = this.extractExports(content);
 
         files.push({
           absolutePath,
           relativePath: match,
           content,
           type,
+          exports,
         });
       }
     }
 
     return files;
+  }
+
+  private extractExports(content: string): ExportedSymbol[] {
+    const symbols: ExportedSymbol[] = [];
+    const language = this.specifiedLanguage || 'typescript';
+
+    if (language === 'typescript' || language === 'javascript') {
+      let match;
+
+      // First, find all exported classes and their positions
+      const classRegex = /export\s+(?:abstract\s+)?class\s+(\w+)/g;
+      const classPositions: Array<{ name: string; start: number; end: number }> = [];
+
+      while ((match = classRegex.exec(content)) !== null) {
+        const className = match[1];
+        const classStart = match.index;
+        const classEnd = this.findClassEnd(content, classStart);
+        classPositions.push({ name: className, start: classStart, end: classEnd });
+        symbols.push({
+          name: className,
+          type: 'class',
+          isDefault: false,
+          qualifiedName: className,
+        });
+      }
+
+      // Export default class
+      const defaultClassRegex = /export\s+default\s+class\s+(\w+)/g;
+      while ((match = defaultClassRegex.exec(content)) !== null) {
+        const className = match[1];
+        const classStart = match.index;
+        const classEnd = this.findClassEnd(content, classStart);
+        classPositions.push({ name: className, start: classStart, end: classEnd });
+        symbols.push({
+          name: className,
+          type: 'class',
+          isDefault: true,
+          qualifiedName: className,
+        });
+      }
+
+      // Find static enums/types inside classes (e.g., static Position = { ... } or static enum Position)
+      for (const classInfo of classPositions) {
+        const classContent = content.slice(classInfo.start, classInfo.end);
+
+        // Static enum-like objects: static Position = { LEFT: 1, RIGHT: 2 }
+        const staticEnumRegex = /static\s+(\w+)\s*=\s*\{/g;
+        while ((match = staticEnumRegex.exec(classContent)) !== null) {
+          const enumName = match[1];
+          // Skip common non-enum static properties
+          if (['DEBUG', 'CATEGORY', 'TEXT_FONT'].includes(enumName)) continue;
+          symbols.push({
+            name: enumName,
+            type: 'enum',
+            isDefault: false,
+            parentClass: classInfo.name,
+            qualifiedName: `${classInfo.name}.${enumName}`,
+          });
+        }
+
+        // Static readonly enum-like: static readonly Position = { ... }
+        const staticReadonlyRegex = /static\s+readonly\s+(\w+)\s*=\s*\{/g;
+        while ((match = staticReadonlyRegex.exec(classContent)) !== null) {
+          const enumName = match[1];
+          symbols.push({
+            name: enumName,
+            type: 'enum',
+            isDefault: false,
+            parentClass: classInfo.name,
+            qualifiedName: `${classInfo.name}.${enumName}`,
+          });
+        }
+      }
+
+      // Export interface
+      const interfaceRegex = /export\s+interface\s+(\w+)/g;
+      while ((match = interfaceRegex.exec(content)) !== null) {
+        symbols.push({
+          name: match[1],
+          type: 'interface',
+          isDefault: false,
+          qualifiedName: match[1],
+        });
+      }
+
+      // Export type
+      const typeRegex = /export\s+type\s+(\w+)/g;
+      while ((match = typeRegex.exec(content)) !== null) {
+        symbols.push({
+          name: match[1],
+          type: 'type',
+          isDefault: false,
+          qualifiedName: match[1],
+        });
+      }
+
+      // Export enum (top-level)
+      const enumRegex = /export\s+(?:const\s+)?enum\s+(\w+)/g;
+      while ((match = enumRegex.exec(content)) !== null) {
+        // Check if this enum is inside a class
+        const enumPos = match.index;
+        const parentClass = classPositions.find(
+          c => enumPos > c.start && enumPos < c.end
+        );
+
+        if (parentClass) {
+          symbols.push({
+            name: match[1],
+            type: 'enum',
+            isDefault: false,
+            parentClass: parentClass.name,
+            qualifiedName: `${parentClass.name}.${match[1]}`,
+          });
+        } else {
+          symbols.push({
+            name: match[1],
+            type: 'enum',
+            isDefault: false,
+            qualifiedName: match[1],
+          });
+        }
+      }
+
+      // Export function
+      const functionRegex = /export\s+(?:async\s+)?function\s+(\w+)/g;
+      while ((match = functionRegex.exec(content)) !== null) {
+        symbols.push({
+          name: match[1],
+          type: 'function',
+          isDefault: false,
+          qualifiedName: match[1],
+        });
+      }
+
+      // Export const/let/var
+      const constRegex = /export\s+(?:const|let|var)\s+(\w+)/g;
+      while ((match = constRegex.exec(content)) !== null) {
+        symbols.push({
+          name: match[1],
+          type: 'const',
+          isDefault: false,
+          qualifiedName: match[1],
+        });
+      }
+    }
+
+    return symbols;
+  }
+
+  private findClassEnd(content: string, startPos: number): number {
+    // Find the opening brace of the class
+    const bracePos = content.indexOf('{', startPos);
+    if (bracePos === -1) return content.length;
+
+    let depth = 1;
+    let pos = bracePos + 1;
+
+    while (pos < content.length && depth > 0) {
+      const char = content[pos];
+      if (char === '{') depth++;
+      else if (char === '}') depth--;
+      pos++;
+    }
+
+    return pos;
   }
 
   private classifyFile(filePath: string): FileType {
