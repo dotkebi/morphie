@@ -25,6 +25,8 @@ export interface PortingTask {
   dartAnalyzeErrorThreshold?: number;
   dartAnalyzeWarningThreshold?: number;
   dartAnalyzeInfoThreshold?: number;
+  resume?: boolean;
+  sessionPath?: string;
 }
 
 export interface TaskUnderstanding {

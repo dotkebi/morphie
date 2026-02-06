@@ -35,6 +35,7 @@ program
   .option('--dart-analyze-error-threshold <count>', 'Auto-refine if dart analyze errors >= count')
   .option('--dart-analyze-warning-threshold <count>', 'Auto-refine if dart analyze warnings >= count')
   .option('--dart-analyze-info-threshold <count>', 'Auto-refine if dart analyze infos >= count')
+  .option('--resume', 'Resume from last session in <target>/.morphie/session.json')
   .action(portProject);
 
 program

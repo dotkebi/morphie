@@ -13,6 +13,7 @@ import { DartAnalyzer } from '../tools/verification/dart-analyzer.js';
 import { ProjectAnalyzer } from './analyzer.js';
 import { FileSystem } from '../utils/filesystem.js';
 import { generateProjectFiles } from '../utils/project-config.js';
+import { SessionManager, type PortingSession } from '../utils/session.js';
 import type {
     PortingTask,
     PortingResult,
@@ -25,6 +26,7 @@ import type {
     PortingError,
     QualityMetrics,
     PortedFile,
+    QualityIssue,
 } from '../types/agent-types.js';
 import type { ProjectAnalysis } from './analyzer.js';
 
@@ -35,6 +37,9 @@ export class AgentOrchestrator {
     private verbose: boolean;
     private interactive: boolean;
     private fs: FileSystem;
+    private sessionManager: SessionManager;
+    private session?: PortingSession;
+    private sessionPath?: string;
     private projectAnalysis?: ProjectAnalysis;
     private lastDartAnalyzeSummary?: { errors: number; warnings: number; infos: number };
     private lastDartAnalyzeReportPath?: string;
@@ -61,6 +66,7 @@ export class AgentOrchestrator {
         this.verbose = options.verbose ?? false;
         this.interactive = options.interactive ?? false;
         this.fs = new FileSystem();
+        this.sessionManager = new SessionManager();
 
         // Register tools
         this.registerTools();
@@ -100,6 +106,16 @@ export class AgentOrchestrator {
         this.conversation.startTask(task);
 
         try {
+            if (task.sessionPath) {
+                this.sessionPath = task.sessionPath;
+            }
+            if (task.resume && this.sessionPath) {
+                const loaded = await this.sessionManager.load(this.sessionPath);
+                if (loaded) {
+                    this.session = loaded;
+                }
+            }
+
             // THINK: Understand the task
             this.log('🤔 THINK: Analyzing task...');
             const understanding = await this.think(task);
@@ -434,6 +450,28 @@ Respond with ONLY the JSON object.
         this.projectAnalysis = await analyzer.analyze();
 
         this.log(`  Found ${this.projectAnalysis.files.length} files to port`);
+
+        if (!this.session && this.sessionPath) {
+            this.session = this.sessionManager.createInitial(
+                task.sourcePath,
+                task.targetPath,
+                task.sourceLanguage,
+                task.targetLanguage,
+                task.model
+            );
+        }
+
+        if (this.session && this.sessionPath) {
+            this.session.analysis = {
+                files: this.projectAnalysis.files.length,
+                entryPoints: this.projectAnalysis.entryPoints,
+                dependencies: this.projectAnalysis.dependencies,
+                structure: this.projectAnalysis.structure,
+            };
+            this.session.totalFiles = this.projectAnalysis.files.length;
+            this.session.phase = 'analysis';
+            await this.sessionManager.save(this.sessionPath, this.session);
+        }
     }
 
     /**
@@ -477,9 +515,10 @@ Respond with ONLY the JSON object.
         }
 
         // Port each file
+        const completed = new Set(this.session?.completedFiles ?? []);
         const filesToPort = onlyFiles
             ? this.projectAnalysis.files.filter(file => onlyFiles.has(file.relativePath))
-            : this.projectAnalysis.files;
+            : this.projectAnalysis.files.filter(file => !completed.has(file.relativePath));
         const totalToPort = filesToPort.length;
 
         for (let i = 0; i < totalToPort; i++) {
@@ -527,6 +566,13 @@ Respond with ONLY the JSON object.
                             recoverable: true,
                         });
                     }
+
+                    if (this.session && this.sessionPath) {
+                        completed.add(file.relativePath);
+                        this.session.completedFiles = Array.from(completed);
+                        this.session.phase = 'porting';
+                        await this.sessionManager.save(this.sessionPath, this.session);
+                    }
                 } else {
                     errors.push({
                         file: file.relativePath,
@@ -535,6 +581,14 @@ Respond with ONLY the JSON object.
                         recoverable: true,
                     });
                     this.log(`  ${progress} ✗ Failed: ${file.relativePath}`);
+                    if (this.session && this.sessionPath) {
+                        this.session.failedFiles.push({
+                            file: file.relativePath,
+                            error: result.error || 'Unknown error',
+                        });
+                        this.session.phase = 'porting';
+                        await this.sessionManager.save(this.sessionPath, this.session);
+                    }
                 }
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : String(error);
@@ -545,6 +599,14 @@ Respond with ONLY the JSON object.
                     recoverable: false,
                 });
                 this.log(`  ${progress} ✗ Error: ${file.relativePath}`);
+                if (this.session && this.sessionPath) {
+                    this.session.failedFiles.push({
+                        file: file.relativePath,
+                        error: errorMessage,
+                    });
+                    this.session.phase = 'porting';
+                    await this.sessionManager.save(this.sessionPath, this.session);
+                }
             }
         }
 
@@ -990,6 +1052,10 @@ Respond with ONLY the JSON object.
      * Finalize the result with duration and metadata
      */
     private finalizeResult(result: PortingResult, startTime: number): PortingResult {
+        if (this.session && this.sessionPath) {
+            this.session.phase = result.errors.length > 0 ? 'failed' : 'completed';
+            void this.sessionManager.save(this.sessionPath, this.session);
+        }
         return {
             ...result,
             duration: Date.now() - startTime,

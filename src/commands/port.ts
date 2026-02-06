@@ -9,6 +9,7 @@ import { AgentOrchestrator } from '../core/agent-orchestrator.js';
 import { OllamaClient } from '../llm/ollama.js';
 import { FileSystem } from '../utils/filesystem.js';
 import { generateProjectFiles } from '../utils/project-config.js';
+import { SessionManager } from '../utils/session.js';
 
 function formatTime(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -39,6 +40,7 @@ interface PortOptions {
   dartAnalyzeErrorThreshold?: string;
   dartAnalyzeWarningThreshold?: string;
   dartAnalyzeInfoThreshold?: string;
+  resume?: boolean;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -190,6 +192,26 @@ export async function portProject(
   const spinner = ora('Initializing...').start();
 
   try {
+    const sessionManager = new SessionManager();
+    const sessionPath = `${target}/.morphie/session.json`;
+    const existingSession = options.resume ? await sessionManager.load(sessionPath) : null;
+    if (options.resume && !existingSession) {
+      spinner.fail('Resume requested but no session found.');
+      process.exit(1);
+    }
+
+    if (existingSession) {
+      const mismatch =
+        existingSession.sourcePath !== source ||
+        existingSession.targetPath !== target ||
+        existingSession.sourceLanguage !== options.from ||
+        existingSession.targetLanguage !== options.to;
+      if (mismatch) {
+        spinner.fail('Session does not match current source/target/language options.');
+        process.exit(1);
+      }
+    }
+
     // Validate source directory
     spinner.text = 'Validating source directory...';
     const fs = new FileSystem();
@@ -241,6 +263,8 @@ export async function portProject(
         dartAnalyzeInfoThreshold: options.dartAnalyzeInfoThreshold !== undefined
           ? parseNonNegativeInt(options.dartAnalyzeInfoThreshold, 0)
           : undefined,
+        resume: options.resume,
+        sessionPath,
       });
 
       if (result.success) {
@@ -265,6 +289,23 @@ export async function portProject(
     spinner.text = 'Analyzing source project...';
     const analyzer = new ProjectAnalyzer(source, options.from);
     const analysis = await analyzer.analyze();
+
+    const session = existingSession ?? sessionManager.createInitial(
+      source,
+      target,
+      options.from,
+      options.to,
+      options.model
+    );
+    session.analysis = {
+      files: analysis.files.length,
+      entryPoints: analysis.entryPoints,
+      dependencies: analysis.dependencies,
+      structure: analysis.structure,
+    };
+    session.totalFiles = analysis.files.length;
+    session.phase = 'analysis';
+    await sessionManager.save(sessionPath, session);
 
     if (options.verbose) {
       spinner.stop();
@@ -308,9 +349,13 @@ export async function portProject(
     let failCount = 0;
     const startTime = Date.now();
     const importIssues: Array<{ file: string; issues: string[]; required: string[]; actual: string[] }> = [];
+    const completed = new Set(existingSession?.completedFiles ?? []);
 
     for (let i = 0; i < analysis.files.length; i++) {
       const file = analysis.files[i];
+      if (completed.has(file.relativePath)) {
+        continue;
+      }
       const progress = `[${i + 1}/${totalFiles}]`;
       const percent = Math.round(((i + 1) / totalFiles) * 100);
       const fileSpinner = ora(`${progress} ${percent}% Porting ${file.relativePath}...`).start();
@@ -329,6 +374,10 @@ export async function portProject(
             actual: result.metadata.actualImports ?? [],
           });
         }
+        completed.add(file.relativePath);
+        session.completedFiles = Array.from(completed);
+        session.phase = 'porting';
+        await sessionManager.save(sessionPath, session);
         fileSpinner.succeed(`${progress} ${file.relativePath} → ${result.targetPath}`);
         successCount++;
       } catch (error) {
@@ -337,6 +386,12 @@ export async function portProject(
           console.log(chalk.red(`  Error: ${error.message}`));
         }
         failCount++;
+        session.failedFiles.push({
+          file: file.relativePath,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        session.phase = 'porting';
+        await sessionManager.save(sessionPath, session);
       }
 
       // Show ETA every 10 files
@@ -395,6 +450,9 @@ export async function portProject(
         process.exitCode = 1;
       }
     }
+
+    session.phase = failCount > 0 ? 'failed' : 'completed';
+    await sessionManager.save(sessionPath, session);
 
     console.log(chalk.green(`\n✅ Porting completed in ${formatTime(totalTime)}!`));
     console.log(`  Success: ${chalk.green(successCount)}`);
