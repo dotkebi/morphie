@@ -36,6 +36,7 @@ program
   .option('--dart-analyze-warning-threshold <count>', 'Auto-refine if dart analyze warnings >= count')
   .option('--dart-analyze-info-threshold <count>', 'Auto-refine if dart analyze infos >= count')
   .option('--resume', 'Resume from last session in <target>/.morphie/session.json')
+  .option('--refresh-understanding', 'Recompute agent understanding even when resuming')
   .action(portProject);
 
 program

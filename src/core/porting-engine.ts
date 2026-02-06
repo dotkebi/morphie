@@ -143,8 +143,7 @@ export class PortingEngine {
       // Remove self-imports (import statements that reference the current file)
       portedContent = this.removeSelfImports(portedContent, targetPath);
 
-      // Remove imports that reference non-existent files
-      portedContent = this.removeInvalidImports(portedContent, targetPath);
+      // Defer invalid-import cleanup to a final post-processing pass
 
       if (this.targetLanguage === 'dart') {
         portedContent = this.enforceDartRequiredNamedParams(portedContent);
@@ -1018,14 +1017,11 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
           }
 
           if (matchesInternal) {
+            // Internal files must use the project package name
             isValid = packageName === this.projectName;
           } else {
-            // For Dart, only keep external package imports if explicitly allowed
-            if (this.targetLanguage === 'dart') {
-              isValid = false;
-            } else {
-              isValid = true;
-            }
+            // External package import - keep (dependency may be added later)
+            isValid = true;
           }
         }
       } else {
@@ -1055,6 +1051,10 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
     }
 
     return cleanedContent.trim();
+  }
+
+  finalizeImportsForTarget(content: string, currentFilePath: string): string {
+    return this.removeInvalidImports(content, currentFilePath);
   }
 
   private convertFilePath(sourcePath: string): string {

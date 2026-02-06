@@ -36,6 +36,42 @@ export function generateProjectConfig(
   return generator ? generator() : null;
 }
 
+export function addDartDependencies(pubspecContent: string, dependencies: string[]): string {
+  if (dependencies.length === 0) {
+    return pubspecContent;
+  }
+
+  const uniqueDeps = Array.from(new Set(dependencies)).sort();
+  const lines = pubspecContent.split('\n');
+  const depIndex = lines.findIndex(line => line.trim() === 'dependencies:');
+
+  if (depIndex === -1) {
+    return pubspecContent;
+  }
+
+  const existing = new Set<string>();
+  for (let i = depIndex + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.trim() === '' || !line.startsWith('  ')) {
+      break;
+    }
+    const nameMatch = line.trim().split(':')[0];
+    if (nameMatch) {
+      existing.add(nameMatch);
+    }
+  }
+
+  const additions = uniqueDeps.filter(dep => !existing.has(dep));
+  if (additions.length === 0) {
+    return pubspecContent;
+  }
+
+  const insertion = additions.map(dep => `  ${dep}: any`);
+  lines.splice(depIndex + 1, 0, ...insertion);
+
+  return lines.join('\n');
+}
+
 function generateGitignore(targetLanguage: string): ProjectConfigFile {
   const ignorePatterns: Record<string, string> = {
     dart: `# Dart/Flutter

@@ -12,8 +12,9 @@ import { SyntaxChecker } from '../tools/verification/syntax-checker.js';
 import { DartAnalyzer } from '../tools/verification/dart-analyzer.js';
 import { ProjectAnalyzer } from './analyzer.js';
 import { FileSystem } from '../utils/filesystem.js';
-import { generateProjectFiles } from '../utils/project-config.js';
+import { addDartDependencies, generateProjectFiles } from '../utils/project-config.js';
 import { SessionManager, type PortingSession } from '../utils/session.js';
+import path from 'path';
 import type {
     PortingTask,
     PortingResult,
@@ -118,7 +119,16 @@ export class AgentOrchestrator {
 
             // THINK: Understand the task
             this.log('🤔 THINK: Analyzing task...');
-            const understanding = await this.think(task);
+            let understanding: TaskUnderstanding;
+            if (this.session?.taskUnderstanding && !task.refreshUnderstanding) {
+                understanding = this.session.taskUnderstanding;
+            } else {
+                understanding = await this.think(task);
+                if (this.session && this.sessionPath) {
+                    this.session.taskUnderstanding = understanding;
+                    await this.sessionManager.save(this.sessionPath, this.session);
+                }
+            }
             this.conversation.addThought('understanding', understanding);
             this.log(`   Project type: ${understanding.projectType}`);
             this.log(`   Complexity: ${understanding.complexity}`);
@@ -395,6 +405,9 @@ Respond with ONLY the JSON object.
                     errors.push(...portingResult.errors);
                     await this.generateProjectFilesIfNeeded(task);
                     if (task.targetLanguage === 'dart') {
+                        await this.postProcessDartProject(task);
+                    }
+                    if (task.targetLanguage === 'dart') {
                         await this.writeImportReport(task, portedFiles);
                     }
                     break;
@@ -648,6 +661,64 @@ Respond with ONLY the JSON object.
             `${task.targetPath}/${projectFiles.readme.filename}`,
             projectFiles.readme.content
         );
+    }
+
+    private async postProcessDartProject(task: PortingTask): Promise<void> {
+        if (task.dryRun || task.targetLanguage !== 'dart') {
+            return;
+        }
+
+        const libDir = `${task.targetPath}/lib`;
+        if (!(await this.fs.directoryExists(libDir))) {
+            return;
+        }
+
+        const projectName = task.targetPath.split('/').pop() || 'project';
+        const engine = new (await import('./porting-engine.js')).PortingEngine(
+            this.llm,
+            task.sourceLanguage,
+            task.targetLanguage,
+            this.verbose,
+            projectName
+        );
+        if (this.projectAnalysis) {
+            engine.buildImportMapping(this.projectAnalysis.files);
+        }
+
+        const files = await this.fs.listFilesRecursive(libDir);
+        const externalPackages = new Set<string>();
+
+        for (const filePath of files) {
+            if (!filePath.endsWith('.dart')) {
+                continue;
+            }
+            const content = await this.fs.readFile(filePath);
+            const relativeTargetPath = path.relative(task.targetPath, filePath).replace(/\\/g, '/');
+            const cleaned = engine.finalizeImportsForTarget(content, relativeTargetPath);
+            if (cleaned !== content) {
+                await this.fs.writeFile(filePath, cleaned);
+            }
+
+            const pkgRegex = /import\s+['"]package:([^/]+)\//g;
+            let match;
+            while ((match = pkgRegex.exec(cleaned)) !== null) {
+                const pkg = match[1];
+                if (pkg && pkg !== projectName) {
+                    externalPackages.add(pkg);
+                }
+            }
+        }
+
+        if (externalPackages.size > 0) {
+            const pubspecPath = `${task.targetPath}/pubspec.yaml`;
+            if (await this.fs.fileExists(pubspecPath)) {
+                const content = await this.fs.readFile(pubspecPath);
+                const updated = addDartDependencies(content, Array.from(externalPackages));
+                if (updated !== content) {
+                    await this.fs.writeFile(pubspecPath, updated);
+                }
+            }
+        }
     }
 
     /**

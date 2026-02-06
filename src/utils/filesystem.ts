@@ -53,4 +53,20 @@ export class FileSystem {
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
     return entries.filter(e => e.isDirectory()).map(e => e.name);
   }
+
+  async listFilesRecursive(dirPath: string): Promise<string[]> {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    const results: string[] = [];
+
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        results.push(...await this.listFilesRecursive(fullPath));
+      } else if (entry.isFile()) {
+        results.push(fullPath);
+      }
+    }
+
+    return results;
+  }
 }

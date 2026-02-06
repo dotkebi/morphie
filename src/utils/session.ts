@@ -11,6 +11,14 @@ export interface PortingSession {
   startedAt: string;
   updatedAt: string;
   phase: 'analysis' | 'porting' | 'verification' | 'completed' | 'failed';
+  taskUnderstanding?: {
+    projectType: string;
+    challenges: string[];
+    criticalFeatures: string[];
+    risks: string[];
+    recommendedStrategy: string;
+    complexity: 'low' | 'medium' | 'high';
+  };
   analysis?: {
     files: number;
     entryPoints: string[];

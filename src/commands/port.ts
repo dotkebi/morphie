@@ -8,7 +8,7 @@ import { PortingEngine } from '../core/porting-engine.js';
 import { AgentOrchestrator } from '../core/agent-orchestrator.js';
 import { OllamaClient } from '../llm/ollama.js';
 import { FileSystem } from '../utils/filesystem.js';
-import { generateProjectFiles } from '../utils/project-config.js';
+import { addDartDependencies, generateProjectFiles } from '../utils/project-config.js';
 import { SessionManager } from '../utils/session.js';
 
 function formatTime(seconds: number): string {
@@ -41,6 +41,7 @@ interface PortOptions {
   dartAnalyzeWarningThreshold?: string;
   dartAnalyzeInfoThreshold?: string;
   resume?: boolean;
+  refreshUnderstanding?: boolean;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -265,6 +266,7 @@ export async function portProject(
           : undefined,
         resume: options.resume,
         sessionPath,
+        refreshUnderstanding: options.refreshUnderstanding,
       });
 
       if (result.success) {
@@ -433,6 +435,10 @@ export async function portProject(
       console.log(chalk.gray(`Import report: ${reportPath}`));
     }
 
+    if (options.to === 'dart') {
+      await postProcessDartProject(target, engine, projectName, fs);
+    }
+
     if (options.dartAnalyze && options.to === 'dart') {
       const reportPath = options.dartAnalyzeReport ?? `${target}/morphie-dart-analyze.txt`;
       const markdownPath = options.dartAnalyzeMd ?? `${target}/morphie-dart-analyze.md`;
@@ -533,4 +539,51 @@ function buildImportReportMarkdown(
   }
 
   return sections.join('\n');
+}
+
+async function postProcessDartProject(
+  target: string,
+  engine: PortingEngine,
+  projectName: string,
+  fs: FileSystem
+): Promise<void> {
+  const libDir = `${target}/lib`;
+  if (!(await fs.directoryExists(libDir))) {
+    return;
+  }
+
+  const files = await fs.listFilesRecursive(libDir);
+  const externalPackages = new Set<string>();
+
+  for (const filePath of files) {
+    if (!filePath.endsWith('.dart')) {
+      continue;
+    }
+    const content = await fs.readFile(filePath);
+    const relativeTargetPath = path.relative(target, filePath).replace(/\\/g, '/');
+    const cleaned = engine.finalizeImportsForTarget(content, relativeTargetPath);
+    if (cleaned !== content) {
+      await fs.writeFile(filePath, cleaned);
+    }
+
+    const pkgRegex = /import\s+['"]package:([^/]+)\//g;
+    let match;
+    while ((match = pkgRegex.exec(cleaned)) !== null) {
+      const pkg = match[1];
+      if (pkg && pkg !== projectName) {
+        externalPackages.add(pkg);
+      }
+    }
+  }
+
+  if (externalPackages.size > 0) {
+    const pubspecPath = `${target}/pubspec.yaml`;
+    if (await fs.fileExists(pubspecPath)) {
+      const content = await fs.readFile(pubspecPath);
+      const updated = addDartDependencies(content, Array.from(externalPackages));
+      if (updated !== content) {
+        await fs.writeFile(pubspecPath, updated);
+      }
+    }
+  }
 }
