@@ -40,6 +40,10 @@ export class FileSystem {
     await fs.copyFile(source, target);
   }
 
+  async removeDirectory(dirPath: string): Promise<void> {
+    await fs.rm(dirPath, { recursive: true, force: true });
+  }
+
   async listFiles(dirPath: string): Promise<string[]> {
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
     return entries.filter(e => e.isFile()).map(e => e.name);

@@ -26,6 +26,11 @@ export interface PortedFile {
   content: string;
   originalPath: string;
   skipped?: boolean;
+  metadata?: {
+    importIssues?: string[];
+    requiredImports?: string[];
+    actualImports?: string[];
+  };
 }
 
 export class PortingEngine {
@@ -95,7 +100,7 @@ export class PortingEngine {
     const targetPath = this.convertFilePath(file.relativePath);
 
     // Handle barrel files (index.ts) differently for Dart
-    if (file.type === 'barrel' && this.targetLanguage === 'dart') {
+    if (file.type === 'barrel' && this.targetLanguage === 'dart' && file.exports.length === 0) {
       const dartExports = this.generateDartLibraryExport(file);
       return {
         targetPath,
@@ -104,24 +109,61 @@ export class PortingEngine {
       };
     }
 
-    const prompt = this.buildPortingPrompt(file);
-    const response = await this.llm.generate(prompt);
+    const maxAttempts = this.targetLanguage === 'dart' ? 2 : 1;
+    let portedContent = '';
+    let importIssues: string[] = [];
+    let requiredImports: string[] = [];
+    let actualImports: string[] = [];
 
-    if (!response || response.trim() === '') {
-      throw new Error('Empty response from LLM');
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let prompt = this.buildPortingPrompt(file);
+
+      if (this.targetLanguage === 'dart' && attempt > 1) {
+        requiredImports = this.getRequiredDartImports(file, targetPath);
+        if (requiredImports.length > 0) {
+          prompt += `\n\n## Import Correction (CRITICAL)\nYou MUST include the exact import statements below:\n${requiredImports.join('\n')}\n`;
+        }
+      }
+
+      const response = await this.llm.generate(prompt, {
+        temperature: 0,
+        topP: 1,
+      });
+
+      if (!response || response.trim() === '') {
+        throw new Error('Empty response from LLM');
+      }
+
+      portedContent = this.extractCode(response);
+
+      if (!portedContent || portedContent.trim() === '') {
+        throw new Error('Failed to extract code from LLM response');
+      }
+
+      // Remove self-imports (import statements that reference the current file)
+      portedContent = this.removeSelfImports(portedContent, targetPath);
+
+      // Remove imports that reference non-existent files
+      portedContent = this.removeInvalidImports(portedContent, targetPath);
+
+      if (this.targetLanguage === 'dart') {
+        portedContent = this.enforceDartRequiredNamedParams(portedContent);
+        portedContent = this.enforceDartExportedConstNames(portedContent, file);
+        portedContent = this.ensureDartRequiredImports(portedContent, file);
+        portedContent = this.normalizeDartImports(portedContent, file);
+
+        const validation = this.validateDartImports(portedContent, file, targetPath);
+        importIssues = validation.issues;
+        requiredImports = validation.requiredImports;
+        actualImports = validation.actualImports;
+
+        if (importIssues.length === 0) {
+          break;
+        }
+      } else {
+        break;
+      }
     }
-
-    let portedContent = this.extractCode(response);
-
-    if (!portedContent || portedContent.trim() === '') {
-      throw new Error('Failed to extract code from LLM response');
-    }
-
-    // Remove self-imports (import statements that reference the current file)
-    portedContent = this.removeSelfImports(portedContent, targetPath);
-    
-    // Remove imports that reference non-existent files
-    portedContent = this.removeInvalidImports(portedContent, targetPath);
 
     // Verify that all exports are included
     const missingExports = this.verifyExports(file, portedContent);
@@ -133,6 +175,13 @@ export class PortingEngine {
       targetPath,
       content: portedContent,
       originalPath: file.relativePath,
+      metadata: this.targetLanguage === 'dart'
+        ? {
+          importIssues,
+          requiredImports,
+          actualImports,
+        }
+        : undefined,
     };
   }
 
@@ -145,12 +194,12 @@ export class PortingEngine {
 
     for (const exportSymbol of file.exports) {
       let symbolName = exportSymbol.name;
-      
+
       // If it's a nested symbol, check for the flattened name (ParentChild)
       if (exportSymbol.parentClass) {
         symbolName = `${exportSymbol.parentClass}${exportSymbol.name}`;
       }
-      
+
       // Check if the symbol appears in the ported content
       // For Dart, check for enum, class, typedef definitions
       let found = false;
@@ -263,10 +312,10 @@ export class PortingEngine {
     // Check if this resolves to the same file (self-import) - should not happen
     const fromSourceWithoutExt = fromSourcePath.replace(/\.(ts|js|tsx|jsx)$/, '');
     const resolvedWithoutExt = resolvedSourcePath.replace(/\.(ts|js|tsx|jsx)$/, '');
-    
+
     // Prevent self-import
-    if (resolvedWithoutExt === fromSourceWithoutExt || 
-        resolvedSourcePath === fromSourcePath) {
+    if (resolvedWithoutExt === fromSourceWithoutExt ||
+      resolvedSourcePath === fromSourcePath) {
       return null; // Self-import detected
     }
 
@@ -302,10 +351,10 @@ export class PortingEngine {
     for (const [sourcePath, targetPath] of this.importMapping.sourcePathToTargetPath) {
       const sourcePathDir = path.dirname(sourcePath).replace(/\\/g, '/');
       const sourcePathBase = path.basename(sourcePath, path.extname(sourcePath));
-      
+
       // Check if the directory matches and it's an index file
-      if (sourcePathDir === resolvedWithoutExt && 
-          (sourcePathBase === 'index' || sourcePathBase === resolvedWithoutExt.split('/').pop())) {
+      if (sourcePathDir === resolvedWithoutExt &&
+        (sourcePathBase === 'index' || sourcePathBase === resolvedWithoutExt.split('/').pop())) {
         return targetPath;
       }
     }
@@ -362,7 +411,7 @@ export class PortingEngine {
 
     // Get symbols defined in the current file (should NOT be imported)
     const currentFileSymbols = file.exports.map(s => s.name);
-    
+
     // Group symbols by type for clearer checklist
     const symbolsByType = {
       enum: file.exports.filter(s => s.type === 'enum'),
@@ -379,7 +428,7 @@ export class PortingEngine {
       `Current file: \`${currentTargetPath}\``,
       '',
       `### Symbols defined in THIS file (MUST be included in the output - DO NOT import these):`,
-      currentFileSymbols.length > 0 
+      currentFileSymbols.length > 0
         ? `**MANDATORY exports to include: ${currentFileSymbols.join(', ')}**`
         : '- None',
       '',
@@ -424,15 +473,9 @@ export class PortingEngine {
           // Use the actual target path from mapping
           const importDir = path.dirname(targetPath).replace(/\\/g, '/');
           const normalizedCurrentDir = currentDir.replace(/\\/g, '/');
-          
+
           // Check if same directory for relative import
-          if (importDir === normalizedCurrentDir) {
-            lines.push(`- \`${imp.path}\` → \`import '${path.basename(targetPath)}';\``);
-          } else {
-            // Use forward slashes for package imports (Dart convention)
-            const packagePath = targetPath.replace(/\\/g, '/');
-            lines.push(`- \`${imp.path}\` → \`import 'package:${this.projectName}/${packagePath}';\``);
-          }
+          lines.push(`- \`${imp.path}\` → \`${this.buildDartImportStatement(targetPath, currentTargetPath)}\``);
         } else {
           // Fallback: convert path manually if not found in mapping
           // This should rarely happen, but provides a fallback
@@ -440,17 +483,13 @@ export class PortingEngine {
             path.join(path.dirname(file.relativePath), imp.path)
               .replace(/\.(ts|js|tsx|jsx)$/, '')
           ).replace(/\\/g, '/');
-          
-          const dartPath = this.toSnakeCase(resolvedSourcePath) + '.dart';
+
+          const dartPath = this.transformPath(this.toSnakeCase(resolvedSourcePath) + '.dart');
           const importDir = path.dirname(dartPath).replace(/\\/g, '/');
           const normalizedCurrentDir = currentDir.replace(/\\/g, '/');
-          
-          if (importDir === normalizedCurrentDir) {
-            lines.push(`- \`${imp.path}\` → \`import '${path.basename(dartPath)}';\``);
-          } else {
-            lines.push(`- \`${imp.path}\` → \`import 'package:${this.projectName}/${dartPath}';\``);
-          }
-          
+
+          lines.push(`- \`${imp.path}\` → \`${this.buildDartImportStatement(dartPath, currentTargetPath)}\``);
+
           if (this.verbose) {
             lines.push(`  ⚠️  Warning: Could not resolve import path "${imp.path}" - using fallback conversion`);
           }
@@ -499,22 +538,17 @@ export class PortingEngine {
         if (filePath === currentTargetPath) continue;
 
         // Check if this symbol is used in the file (by name or qualified name)
-        const isUsed = file.content.includes(symbol.name) || 
-                       file.content.includes(qualifiedName) ||
-                       (symbol.parentClass && file.content.includes(`${symbol.parentClass}.${symbol.name}`));
+        const isUsed = file.content.includes(symbol.name) ||
+          file.content.includes(qualifiedName) ||
+          (symbol.parentClass && file.content.includes(`${symbol.parentClass}.${symbol.name}`));
 
         if (isUsed) {
           const importDir = path.dirname(filePath).replace(/\\/g, '/');
           const normalizedCurrentDir = currentDir.replace(/\\/g, '/');
-          
+
           // Determine import statement
           let importStatement: string;
-          if (importDir === normalizedCurrentDir) {
-            importStatement = `import '${path.basename(filePath)}';`;
-          } else {
-            const packagePath = filePath.replace(/\\/g, '/');
-            importStatement = `import 'package:${this.projectName}/${packagePath}';`;
-          }
+          importStatement = this.buildDartImportStatement(filePath, currentTargetPath);
 
           if (symbol.parentClass) {
             // Nested type - show flattened access
@@ -599,6 +633,30 @@ ${targetFeatures}
 12. **CRITICAL: Include ALL methods, including private methods** - If a class has \`private addListener(...)\` in TypeScript, you MUST include it as \`void _addListener(...)\` in Dart (Dart uses underscore prefix for private). Do NOT skip any methods, whether public or private.
 
 ${importContext}
+
+## Dart Constructor & Constant Rules (CRITICAL)
+1. **Named Parameters Validation**:
+   - For non-nullable fields in a class with named parameters, you MUST use the required keyword.
+   - WRONG: const Config({this.port}); (if port is final int port)
+   - RIGHT: const Config({required this.port});
+   - Exception: If the field is nullable (e.g., final int? port), then required is optional.
+
+2. **Top-Level Constants to Class Conversion**:
+   - If the source has a top-level constant object (e.g., export const CONFIG = { ... }), convert it to:
+     1. A Dart class definition defining the structure.
+     2. A global constant instance of that class.
+   - **CRITICAL: Preserve the constant identifier name exactly (case-sensitive)**. If the source is \`CONFIG\`, the Dart constant must be named \`CONFIG\`.
+   - Example:
+     Source: export const CONFIG = { port: 3000 };
+     Target:
+     \\\`\\\`\\\`dart
+     class Config {
+       final int port;
+       const Config({required this.port});
+     }
+     
+     const CONFIG = Config(port: 3000);
+     \\\`\\\`\\\`
 
 ## TypeScript to Dart Enum Conversion
 When converting TypeScript enums with explicit values to Dart, use enhanced enums.
@@ -878,10 +936,10 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
     // Get the base name of the current file (e.g., "calculator.dart" from "src/calculator.dart")
     const currentFileName = path.basename(currentFilePath);
     const currentFileNameWithoutExt = path.basename(currentFilePath, path.extname(currentFilePath));
-    
+
     // Normalize current file path for comparison (remove leading slash, use forward slashes)
     const normalizedCurrentPath = currentFilePath.replace(/\\/g, '/').replace(/^\//, '');
-    
+
     // Patterns to match self-imports
     const selfImportPatterns = [
       // Match: import 'package:.../current_file.dart';
@@ -916,7 +974,11 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
     // Get all valid target file paths from the mapping
     const validTargetPaths = new Set<string>();
     for (const targetPath of this.importMapping.sourcePathToTargetPath.values()) {
-      validTargetPaths.add(targetPath.replace(/\\/g, '/'));
+      const normalized = targetPath.replace(/\\/g, '/');
+      validTargetPaths.add(normalized);
+      if (this.targetLanguage === 'dart' && normalized.startsWith('lib/')) {
+        validTargetPaths.add(normalized.slice(4));
+      }
       // Also add basename for relative imports
       validTargetPaths.add(path.basename(targetPath));
     }
@@ -938,18 +1000,31 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
 
       // For package imports, extract the file path
       if (importPath.startsWith('package:')) {
-        const packageMatch = importPath.match(/package:[^/]+\/(.+)/);
+        const packageMatch = importPath.match(/package:([^/]+)\/(.+)/);
         if (packageMatch) {
-          const filePath = packageMatch[1].replace(/\\/g, '/');
-          
+          const packageName = packageMatch[1];
+          const filePath = packageMatch[2].replace(/\\/g, '/');
+
           // Check if this file exists in our mapping
+          let matchesInternal = false;
           for (const targetPath of validTargetPaths) {
             const normalizedTarget = targetPath.replace(/\\/g, '/');
-            if (normalizedTarget === filePath || 
-                normalizedTarget.endsWith('/' + filePath) ||
-                normalizedTarget === filePath.replace(/\.dart$/, '') + '.dart') {
-              isValid = true;
+            if (normalizedTarget === filePath ||
+              normalizedTarget.endsWith('/' + filePath) ||
+              normalizedTarget === filePath.replace(/\.dart$/, '') + '.dart') {
+              matchesInternal = true;
               break;
+            }
+          }
+
+          if (matchesInternal) {
+            isValid = packageName === this.projectName;
+          } else {
+            // For Dart, only keep external package imports if explicitly allowed
+            if (this.targetLanguage === 'dart') {
+              isValid = false;
+            } else {
+              isValid = true;
             }
           }
         }
@@ -959,11 +1034,11 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
         const resolvedPath = path.normalize(
           path.join(currentDir, importPath)
         ).replace(/\\/g, '/');
-        
+
         for (const targetPath of validTargetPaths) {
           const normalizedTarget = targetPath.replace(/\\/g, '/');
-          if (normalizedTarget === resolvedPath || 
-              normalizedTarget.endsWith('/' + path.basename(importPath))) {
+          if (normalizedTarget === resolvedPath ||
+            normalizedTarget.endsWith('/' + path.basename(importPath))) {
             isValid = true;
             break;
           }
@@ -1006,11 +1081,554 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
       return filePath.replace(/([a-z])_([a-z])/g, (_, a, b) => a + b.toUpperCase());
     }
 
-    if (['javascript', 'typescript'].includes(this.sourceLanguage) && this.targetLanguage === 'dart') {
-      // Convert camelCase to snake_case for Dart (Dart convention for file names)
-      return filePath.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+    if (this.targetLanguage === 'dart') {
+      let updatedPath = filePath;
+
+      if (updatedPath.startsWith('src/')) {
+        updatedPath = 'lib/' + updatedPath.slice(4);
+      } else if (updatedPath.startsWith('src\\')) {
+        updatedPath = 'lib/' + updatedPath.slice(4);
+      }
+
+      if (['javascript', 'typescript'].includes(this.sourceLanguage)) {
+        // Convert camelCase to snake_case for Dart (Dart convention for file names)
+        updatedPath = updatedPath.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+      }
+
+      return updatedPath;
     }
 
     return filePath;
+  }
+
+  private stripDartLibPrefix(filePath: string): string {
+    if (this.targetLanguage !== 'dart') {
+      return filePath;
+    }
+
+    if (filePath.startsWith('lib/')) {
+      return filePath.slice(4);
+    }
+    if (filePath.startsWith('lib\\')) {
+      return filePath.slice(4);
+    }
+
+    return filePath;
+  }
+
+  private buildDartImportStatement(targetPath: string, currentTargetPath: string): string {
+    const normalizedTarget = targetPath.replace(/\\/g, '/');
+    const normalizedCurrent = currentTargetPath.replace(/\\/g, '/');
+
+    if (normalizedTarget.startsWith('lib/') && normalizedCurrent.startsWith('lib/')) {
+      const currentDir = path.posix.dirname(normalizedCurrent);
+      const relative = path.posix.relative(currentDir, normalizedTarget);
+      const normalizedRelative = relative === '' ? path.posix.basename(normalizedTarget) : relative;
+      return `import '${normalizedRelative}';`;
+    }
+
+    const packagePath = this.stripDartLibPrefix(normalizedTarget);
+    return `import 'package:${this.projectName}/${packagePath}';`;
+  }
+
+  private enforceDartRequiredNamedParams(content: string): string {
+    let updatedContent = content;
+    const classRegex = /\bclass\s+([A-Za-z_]\w*)\s*{/g;
+    const matches: Array<{ name: string; start: number; bodyStart: number; bodyEnd: number }> = [];
+
+    let match: RegExpExecArray | null;
+    while ((match = classRegex.exec(content)) !== null) {
+      const name = match[1];
+      const bodyStart = match.index + match[0].length;
+      let depth = 1;
+      let i = bodyStart;
+      while (i < content.length && depth > 0) {
+        const char = content[i];
+        if (char === '{') {
+          depth += 1;
+        } else if (char === '}') {
+          depth -= 1;
+        }
+        i += 1;
+      }
+      if (depth === 0) {
+        matches.push({ name, start: match.index, bodyStart, bodyEnd: i - 1 });
+      }
+    }
+
+    for (let index = matches.length - 1; index >= 0; index -= 1) {
+      const { name, bodyStart, bodyEnd } = matches[index];
+      const classBody = updatedContent.slice(bodyStart, bodyEnd);
+      const requiredFields = this.collectNonNullableFinalFields(classBody);
+      if (requiredFields.size === 0) {
+        continue;
+      }
+
+      const updatedBody = this.fixDartConstructors(classBody, name, requiredFields);
+      updatedContent = updatedContent.slice(0, bodyStart) + updatedBody + updatedContent.slice(bodyEnd);
+    }
+
+    return updatedContent;
+  }
+
+  private collectNonNullableFinalFields(classBody: string): Set<string> {
+    const requiredFields = new Set<string>();
+    const fieldRegex = /\b(?:late\s+)?final\s+([A-Za-z0-9_<>,\s?]+)\s+([A-Za-z_]\w*)\s*;/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = fieldRegex.exec(classBody)) !== null) {
+      const type = match[1].trim();
+      const name = match[2];
+      if (!type.includes('?')) {
+        requiredFields.add(name);
+      }
+    }
+
+    return requiredFields;
+  }
+
+  private fixDartConstructors(
+    classBody: string,
+    className: string,
+    requiredFields: Set<string>
+  ): string {
+    const constructorRegex = new RegExp(
+      `\\b(?:const\\s+)?(?:factory\\s+)?${className}(?:\\s*\\.\\s*[A-Za-z_]\\w*)?\\s*\\(`,
+      'g'
+    );
+    const matches: Array<{ startIndex: number; endIndex: number; content: string }> = [];
+    let match: RegExpExecArray | null;
+
+    while ((match = constructorRegex.exec(classBody)) !== null) {
+      const startIndex = match.index + match[0].length;
+      const parsed = this.parseParenthesesBlock(classBody, startIndex - 1);
+      if (!parsed) {
+        continue;
+      }
+
+      matches.push({
+        startIndex,
+        endIndex: parsed.endIndex,
+        content: parsed.content,
+      });
+    }
+
+    let updatedBody = classBody;
+    for (let i = matches.length - 1; i >= 0; i -= 1) {
+      const { startIndex, endIndex, content } = matches[i];
+      const fixedParams = this.fixNamedParams(content, requiredFields);
+      if (fixedParams === content) {
+        continue;
+      }
+
+      updatedBody =
+        updatedBody.slice(0, startIndex) +
+        fixedParams +
+        updatedBody.slice(endIndex);
+    }
+
+    return updatedBody;
+  }
+
+  private parseParenthesesBlock(
+    source: string,
+    openParenIndex: number
+  ): { content: string; endIndex: number } | null {
+    if (source[openParenIndex] !== '(') {
+      return null;
+    }
+
+    let depth = 0;
+    let i = openParenIndex;
+    let inString: "'" | '"' | null = null;
+
+    while (i < source.length) {
+      const char = source[i];
+      if (inString) {
+        if (char === inString && source[i - 1] !== '\\') {
+          inString = null;
+        }
+      } else if (char === '"' || char === "'") {
+        inString = char;
+      } else if (char === '(') {
+        depth += 1;
+      } else if (char === ')') {
+        depth -= 1;
+        if (depth === 0) {
+          return {
+            content: source.slice(openParenIndex + 1, i),
+            endIndex: i,
+          };
+        }
+      }
+      i += 1;
+    }
+
+    return null;
+  }
+
+  private fixNamedParams(params: string, requiredFields: Set<string>): string {
+    const namedBlock = this.extractNamedParamBlock(params);
+    if (!namedBlock) {
+      return params;
+    }
+
+    const { startIndex, endIndex, content } = namedBlock;
+    const parts = this.splitTopLevelParams(content);
+    const updatedParts = parts.map((part) =>
+      this.ensureRequiredOnParam(part, requiredFields)
+    );
+    const updatedNamed = updatedParts.join(', ');
+
+    return params.slice(0, startIndex) + updatedNamed + params.slice(endIndex);
+  }
+
+  private extractNamedParamBlock(params: string): { startIndex: number; endIndex: number; content: string } | null {
+    let depth = 0;
+    let startIndex = -1;
+    for (let i = 0; i < params.length; i += 1) {
+      const char = params[i];
+      if (char === '{') {
+        if (depth === 0) {
+          startIndex = i + 1;
+        }
+        depth += 1;
+      } else if (char === '}') {
+        depth -= 1;
+        if (depth === 0 && startIndex !== -1) {
+          return {
+            startIndex,
+            endIndex: i,
+            content: params.slice(startIndex, i),
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private splitTopLevelParams(content: string): string[] {
+    const parts: string[] = [];
+    let current = '';
+    let depthParen = 0;
+    let depthAngle = 0;
+    let depthSquare = 0;
+    let depthBrace = 0;
+    let inString: "'" | '"' | null = null;
+
+    for (let i = 0; i < content.length; i += 1) {
+      const char = content[i];
+      if (inString) {
+        current += char;
+        if (char === inString && content[i - 1] !== '\\') {
+          inString = null;
+        }
+        continue;
+      }
+
+      if (char === '"' || char === "'") {
+        inString = char;
+        current += char;
+        continue;
+      }
+
+      if (char === '(') depthParen += 1;
+      if (char === ')') depthParen -= 1;
+      if (char === '<') depthAngle += 1;
+      if (char === '>') depthAngle = Math.max(0, depthAngle - 1);
+      if (char === '[') depthSquare += 1;
+      if (char === ']') depthSquare -= 1;
+      if (char === '{') depthBrace += 1;
+      if (char === '}') depthBrace -= 1;
+
+      if (
+        char === ',' &&
+        depthParen === 0 &&
+        depthAngle === 0 &&
+        depthSquare === 0 &&
+        depthBrace === 0
+      ) {
+        if (current.trim() !== '') {
+          parts.push(current.trim());
+        }
+        current = '';
+        continue;
+      }
+
+      current += char;
+    }
+
+    if (current.trim() !== '') {
+      parts.push(current.trim());
+    }
+
+    return parts;
+  }
+
+  private enforceDartExportedConstNames(content: string, file: SourceFile): string {
+    let updatedContent = content;
+    const constExports = file.exports.filter(symbol => symbol.type === 'const');
+
+    for (const symbol of constExports) {
+      const name = symbol.name;
+      if (updatedContent.includes(name)) {
+        continue;
+      }
+
+      if (name === name.toUpperCase()) {
+        const lower = name.toLowerCase();
+        const declRegex = new RegExp(`\\b(const|final|var)\\s+${this.escapeRegex(lower)}\\b`);
+        updatedContent = updatedContent.replace(declRegex, `$1 ${name}`);
+      }
+    }
+
+    return updatedContent;
+  }
+
+  private ensureDartRequiredImports(content: string, file: SourceFile): string {
+    const imports = this.extractSourceImports(file.content);
+    if (imports.length === 0) {
+      return content;
+    }
+
+    const targetPath = this.convertFilePath(file.relativePath);
+    const currentDir = path.dirname(targetPath).replace(/\\/g, '/');
+    const requiredImports = new Set<string>();
+
+    for (const imp of imports) {
+      const resolved = this.resolveImportPath(imp.path, file.relativePath);
+      let importStatement: string;
+
+      if (resolved) {
+        importStatement = this.buildDartImportStatement(resolved, targetPath);
+      } else {
+        const resolvedSourcePath = path.normalize(
+          path.join(path.dirname(file.relativePath), imp.path)
+            .replace(/\.(ts|js|tsx|jsx)$/, '')
+        ).replace(/\\/g, '/');
+        const dartPath = this.transformPath(this.toSnakeCase(resolvedSourcePath) + '.dart');
+        importStatement = this.buildDartImportStatement(dartPath, targetPath);
+      }
+
+      requiredImports.add(importStatement);
+    }
+
+    if (requiredImports.size === 0) {
+      return content;
+    }
+
+    const lines = content.split('\n');
+    const existingImports = new Set<string>();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('import ')) {
+        existingImports.add(trimmed);
+      }
+    }
+
+    const missing = Array.from(requiredImports).filter(statement => !existingImports.has(statement));
+    if (missing.length === 0) {
+      return content;
+    }
+
+    let insertAt = 0;
+    for (let i = 0; i < lines.length; i += 1) {
+      const trimmed = lines[i].trim();
+      if (
+        trimmed.startsWith('library ') ||
+        trimmed.startsWith('part of ') ||
+        trimmed.startsWith('part ') ||
+        trimmed.startsWith('import ') ||
+        trimmed.startsWith('export ')
+      ) {
+        insertAt = i + 1;
+        continue;
+      }
+      if (trimmed !== '') {
+        break;
+      }
+    }
+
+    const updatedLines = [
+      ...lines.slice(0, insertAt),
+      ...missing,
+      '',
+      ...lines.slice(insertAt),
+    ];
+
+    return updatedLines.join('\n').replace(/\n{3,}/g, '\n\n');
+  }
+
+  private normalizeDartImports(content: string, file: SourceFile): string {
+    const imports = this.extractSourceImports(file.content);
+    if (imports.length === 0) {
+      return content;
+    }
+
+    const targetPath = this.convertFilePath(file.relativePath);
+    const requiredImports = new Set<string>();
+
+    for (const imp of imports) {
+      const resolved = this.resolveImportPath(imp.path, file.relativePath);
+      let importStatement: string;
+
+      if (resolved) {
+        importStatement = this.buildDartImportStatement(resolved, targetPath);
+      } else {
+        const resolvedSourcePath = path.normalize(
+          path.join(path.dirname(file.relativePath), imp.path)
+            .replace(/\.(ts|js|tsx|jsx)$/, '')
+        ).replace(/\\/g, '/');
+        const dartPath = this.transformPath(this.toSnakeCase(resolvedSourcePath) + '.dart');
+        importStatement = this.buildDartImportStatement(dartPath, targetPath);
+      }
+
+      requiredImports.add(importStatement);
+    }
+
+    const lines = content.split('\n');
+    const keptLines: string[] = [];
+    let insertAt = 0;
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const trimmed = lines[i].trim();
+      if (trimmed.startsWith('import ')) {
+        continue;
+      }
+      if (
+        trimmed.startsWith('library ') ||
+        trimmed.startsWith('part of ') ||
+        trimmed.startsWith('part ') ||
+        trimmed.startsWith('export ')
+      ) {
+        keptLines.push(lines[i]);
+        insertAt = keptLines.length;
+        continue;
+      }
+      keptLines.push(lines[i]);
+    }
+
+    const normalizedImports = Array.from(requiredImports);
+    if (normalizedImports.length === 0) {
+      return keptLines.join('\n');
+    }
+
+    const updatedLines = [
+      ...keptLines.slice(0, insertAt),
+      ...normalizedImports,
+      '',
+      ...keptLines.slice(insertAt),
+    ];
+
+    return updatedLines.join('\n').replace(/\n{3,}/g, '\n\n');
+  }
+
+  private extractSourceImports(content: string): Array<{ path: string; symbols: string[] }> {
+    const importRegex = /import\s+(?:\{[^}]+\}|\*\s+as\s+\w+|\w+)\s+from\s+['"]([^'"]+)['"]/g;
+    const imports: Array<{ path: string; symbols: string[] }> = [];
+    let match;
+
+    while ((match = importRegex.exec(content)) !== null) {
+      const importPath = match[1];
+      const symbolMatch = match[0].match(/import\s+\{([^}]+)\}/);
+      const symbols = symbolMatch
+        ? symbolMatch[1].split(',').map(s => s.trim().split(' as ')[0].trim())
+        : [];
+      imports.push({ path: importPath, symbols });
+    }
+
+    return imports;
+  }
+
+  private getRequiredDartImports(file: SourceFile, targetPath: string): string[] {
+    const imports = this.extractSourceImports(file.content);
+    const requiredImports = new Set<string>();
+
+    for (const imp of imports) {
+      const resolved = this.resolveImportPath(imp.path, file.relativePath);
+      let importStatement: string;
+
+      if (resolved) {
+        importStatement = this.buildDartImportStatement(resolved, targetPath);
+      } else {
+        const resolvedSourcePath = path.normalize(
+          path.join(path.dirname(file.relativePath), imp.path)
+            .replace(/\.(ts|js|tsx|jsx)$/, '')
+        ).replace(/\\/g, '/');
+        const dartPath = this.transformPath(this.toSnakeCase(resolvedSourcePath) + '.dart');
+        importStatement = this.buildDartImportStatement(dartPath, targetPath);
+      }
+
+      requiredImports.add(importStatement);
+    }
+
+    return Array.from(requiredImports);
+  }
+
+  private extractDartImportLines(content: string): string[] {
+    const lines = content.split('\n');
+    return lines
+      .map(line => line.trim())
+      .filter(line => line.startsWith('import '))
+      .map(line => (line.endsWith(';') ? line : `${line};`));
+  }
+
+  private validateDartImports(
+    content: string,
+    file: SourceFile,
+    targetPath: string
+  ): { issues: string[]; requiredImports: string[]; actualImports: string[] } {
+    const issues: string[] = [];
+    const requiredImports = this.getRequiredDartImports(file, targetPath);
+    const actualImports = this.extractDartImportLines(content);
+
+    for (const required of requiredImports) {
+      if (!actualImports.includes(required)) {
+        issues.push(`Missing import: ${required}`);
+      }
+    }
+
+    for (const actual of actualImports) {
+      const packageMatch = actual.match(/import\s+['"]package:([^/]+)\//);
+      if (packageMatch && packageMatch[1] !== this.projectName) {
+        issues.push(`Invalid package import: ${actual}`);
+      }
+    }
+
+    return { issues, requiredImports, actualImports };
+  }
+
+  private ensureRequiredOnParam(part: string, requiredFields: Set<string>): string {
+    const trimmed = part.trim();
+    if (
+      trimmed === '' ||
+      /\brequired\b/.test(trimmed) ||
+      /@required\b/i.test(trimmed) ||
+      trimmed.includes('=')
+    ) {
+      return part;
+    }
+
+    let fieldName: string | null = null;
+    const thisMatch = /\bthis\.([A-Za-z_]\w*)\b/.exec(trimmed);
+    if (thisMatch) {
+      fieldName = thisMatch[1];
+    } else {
+      const bareMatch = /\b([A-Za-z_]\w*)\b\s*$/.exec(trimmed);
+      if (bareMatch) {
+        fieldName = bareMatch[1];
+      }
+    }
+
+    if (!fieldName || !requiredFields.has(fieldName)) {
+      return part;
+    }
+
+    if (trimmed.includes('?')) {
+      return part;
+    }
+
+    return `required ${trimmed}`;
   }
 }

@@ -111,7 +111,7 @@ export class ProjectAnalyzer {
       for (const match of matches) {
         const absolutePath = path.join(this.sourcePath, match);
         const content = await this.fs.readFile(absolutePath);
-        const type = this.classifyFile(match);
+        const type = this.classifyFile(match, content);
         const exports = this.extractExports(content);
 
         files.push({
@@ -292,12 +292,13 @@ export class ProjectAnalyzer {
     return pos;
   }
 
-  private classifyFile(filePath: string): FileType {
+  private classifyFile(filePath: string, content: string): FileType {
     const lowerPath = filePath.toLowerCase();
     const fileName = path.basename(lowerPath);
 
     // Barrel files (re-export files)
-    if (fileName === 'index.ts' || fileName === 'index.js' || fileName === 'index.mjs') {
+    if ((fileName === 'index.ts' || fileName === 'index.js' || fileName === 'index.mjs') &&
+      this.isBarrelFile(content)) {
       return 'barrel';
     }
     if (lowerPath.includes('test') || lowerPath.includes('spec')) {
@@ -317,6 +318,28 @@ export class ProjectAnalyzer {
     }
 
     return 'source';
+  }
+
+  private isBarrelFile(content: string): boolean {
+    const stripped = content
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0)
+      .filter(line => !line.startsWith('//') && !line.startsWith('/*') && !line.startsWith('*'));
+
+    if (stripped.length === 0) {
+      return false;
+    }
+
+    const hasConcreteExports = /export\s+(?:class|interface|type|enum|function|const|let|var)\b/.test(content);
+    if (hasConcreteExports) {
+      return false;
+    }
+
+    const exportFromRegex = /^export\s+(?:\*|\{[^}]*\})\s+from\s+['"][^'"]+['"]\s*;?$/;
+    const exportListRegex = /^export\s+\{[^}]*\}\s*;?$/;
+
+    return stripped.every(line => exportFromRegex.test(line) || exportListRegex.test(line));
   }
 
   private findEntryPoints(files: SourceFile[], language: string): string[] {

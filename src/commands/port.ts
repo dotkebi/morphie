@@ -1,8 +1,11 @@
 import chalk from 'chalk';
 import ora from 'ora';
 import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { ProjectAnalyzer } from '../core/analyzer.js';
 import { PortingEngine } from '../core/porting-engine.js';
+import { AgentOrchestrator } from '../core/agent-orchestrator.js';
 import { OllamaClient } from '../llm/ollama.js';
 import { FileSystem } from '../utils/filesystem.js';
 import { generateProjectFiles } from '../utils/project-config.js';
@@ -24,6 +27,157 @@ interface PortOptions {
   ollamaUrl: string;
   dryRun?: boolean;
   verbose?: boolean;
+  agent?: boolean;
+  interactive?: boolean;
+  dartAnalyze?: boolean;
+  dartAnalyzeReport?: string;
+  dartAnalyzeMd?: string;
+  dartAnalyzeFailOnWarnings?: boolean;
+  dartAnalyzeTop?: string;
+  dartAnalyzeRetryThreshold?: string;
+  dartAnalyzeMaxRetries?: string;
+  dartAnalyzeErrorThreshold?: string;
+  dartAnalyzeWarningThreshold?: string;
+  dartAnalyzeInfoThreshold?: string;
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+function parseNonNegativeInt(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+const execFileAsync = promisify(execFile);
+
+interface DartAnalyzeSummary {
+  errors: number;
+  warnings: number;
+  infos: number;
+}
+
+function summarizeDartAnalyze(output: string): DartAnalyzeSummary {
+  const summary: DartAnalyzeSummary = { errors: 0, warnings: 0, infos: 0 };
+  const lines = output.split('\n');
+
+  for (const line of lines) {
+    if (line.includes(' • ') && line.includes(' error')) {
+      summary.errors += 1;
+    } else if (line.includes(' • ') && line.includes(' warning')) {
+      summary.warnings += 1;
+    } else if (line.includes(' • ') && line.includes(' info')) {
+      summary.infos += 1;
+    }
+  }
+
+  return summary;
+}
+
+function buildDartAnalyzeMarkdown(
+  summary: DartAnalyzeSummary,
+  reportPath: string,
+  output: string,
+  topIssues: number
+): string {
+  const lines = output
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line.includes(' • '));
+
+  const limited = topIssues > 0 ? lines.slice(0, topIssues) : lines;
+  const items = limited.length > 0
+    ? limited.map(line => `- ${line}`).join('\n')
+    : '- No issues reported.';
+
+  return [
+    '# Dart Analyze Report',
+    '',
+    `Report file: \`${reportPath}\``,
+    `Total issues: ${lines.length}`,
+    '',
+    '## Summary',
+    `- Errors: ${summary.errors}`,
+    `- Warnings: ${summary.warnings}`,
+    `- Infos: ${summary.infos}`,
+    '',
+    '## Top Issues',
+    items,
+    lines.length > limited.length ? `\n(Showing top ${limited.length} of ${lines.length} issues)` : '',
+    '',
+  ].join('\n');
+}
+
+async function runDartAnalyze(
+  target: string,
+  reportPath: string,
+  markdownPath: string,
+  fs: FileSystem,
+  failOnWarnings: boolean,
+  topIssues: number,
+  verbose?: boolean
+): Promise<boolean> {
+  try {
+    await execFileAsync('dart', ['--version']);
+  } catch (error) {
+    console.log(chalk.yellow('\n⚠️  Dart SDK not found. Skipping dart analyze.'));
+    if (verbose && error instanceof Error) {
+      console.log(chalk.gray(`  ${error.message}`));
+    }
+    return false;
+  }
+
+  console.log(chalk.cyan('\n🔍 Running: dart analyze'));
+  try {
+    const result = await execFileAsync('dart', ['analyze'], {
+      cwd: target,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+    if (output) {
+      console.log(output);
+    }
+    await fs.writeFile(reportPath, output || 'No issues reported.');
+    const summary = summarizeDartAnalyze(output);
+    const markdown = buildDartAnalyzeMarkdown(summary, reportPath, output, topIssues);
+    await fs.writeFile(markdownPath, markdown);
+    console.log(chalk.gray(`Report: ${reportPath}`));
+    console.log(chalk.gray(`Markdown: ${markdownPath}`));
+    console.log(chalk.gray(`Summary: ${summary.errors} errors, ${summary.warnings} warnings, ${summary.infos} infos`));
+    const valid = summary.errors === 0 && (!failOnWarnings || summary.warnings === 0);
+    if (valid) {
+      console.log(chalk.green('✅ dart analyze completed with no errors.'));
+    } else {
+      console.log(chalk.red('❌ dart analyze reported issues.'));
+    }
+    return valid;
+  } catch (error) {
+    const err = error as { stdout?: string; stderr?: string; message?: string };
+    const output = `${err.stdout ?? ''}${err.stderr ?? ''}`.trim();
+    if (output) {
+      console.log(output);
+    }
+    await fs.writeFile(reportPath, output || 'dart analyze failed with no output.');
+    const summary = summarizeDartAnalyze(output);
+    const markdown = buildDartAnalyzeMarkdown(summary, reportPath, output, topIssues);
+    await fs.writeFile(markdownPath, markdown);
+    console.log(chalk.gray(`Report: ${reportPath}`));
+    console.log(chalk.gray(`Markdown: ${markdownPath}`));
+    console.log(chalk.gray(`Summary: ${summary.errors} errors, ${summary.warnings} warnings, ${summary.infos} infos`));
+    console.log(chalk.red('❌ dart analyze reported issues.'));
+    if (verbose && err.message) {
+      console.log(chalk.gray(`  ${err.message}`));
+    }
+    return false;
+  }
 }
 
 export async function portProject(
@@ -53,6 +207,60 @@ export async function portProject(
       process.exit(1);
     }
 
+    // Use Agent mode by default (can be disabled with --no-agent)
+    if (options.agent !== false) {
+      spinner.succeed('Agent mode enabled');
+      console.log(chalk.magenta('\n🤖 Running with Agent Orchestrator...\n'));
+
+      const orchestrator = new AgentOrchestrator(llm, {
+        verbose: options.verbose,
+        interactive: options.interactive,
+      });
+
+      const result = await orchestrator.execute({
+        sourcePath: source,
+        targetPath: target,
+        sourceLanguage: options.from,
+        targetLanguage: options.to,
+        model: options.model,
+        dryRun: options.dryRun,
+        verbose: options.verbose,
+        dartAnalyze: options.dartAnalyze,
+        dartAnalyzeReport: options.dartAnalyzeReport,
+        dartAnalyzeMarkdownReport: options.dartAnalyzeMd,
+        dartAnalyzeFailOnWarnings: options.dartAnalyzeFailOnWarnings,
+        dartAnalyzeTopIssues: parsePositiveInt(options.dartAnalyzeTop, 10),
+        dartAnalyzeRetryThreshold: parsePositiveInt(options.dartAnalyzeRetryThreshold, 1),
+        dartAnalyzeMaxRetries: parsePositiveInt(options.dartAnalyzeMaxRetries, 1),
+        dartAnalyzeErrorThreshold: options.dartAnalyzeErrorThreshold !== undefined
+          ? parseNonNegativeInt(options.dartAnalyzeErrorThreshold, 0)
+          : undefined,
+        dartAnalyzeWarningThreshold: options.dartAnalyzeWarningThreshold !== undefined
+          ? parseNonNegativeInt(options.dartAnalyzeWarningThreshold, 0)
+          : undefined,
+        dartAnalyzeInfoThreshold: options.dartAnalyzeInfoThreshold !== undefined
+          ? parseNonNegativeInt(options.dartAnalyzeInfoThreshold, 0)
+          : undefined,
+      });
+
+      if (result.success) {
+        console.log(chalk.green(`\n✅ Agent completed successfully!`));
+        console.log(`  Total files: ${chalk.cyan(result.totalFiles)}`);
+        console.log(`  Success: ${chalk.green(result.successCount)}`);
+        console.log(`  Failed: ${chalk.red(result.failureCount)}`);
+        console.log(`  Duration: ${chalk.yellow(formatTime(Math.round(result.duration / 1000)))}`);
+        if (result.qualityScore) {
+          console.log(`  Quality score: ${chalk.cyan(result.qualityScore + '/100')}`);
+        }
+      } else {
+        console.log(chalk.red(`\n❌ Agent encountered errors:`));
+        result.errors.forEach(err => {
+          console.log(chalk.red(`  - ${err.message}`));
+        });
+      }
+      return;
+    }
+
     // Analyze source project
     spinner.text = 'Analyzing source project...';
     const analyzer = new ProjectAnalyzer(source, options.from);
@@ -79,6 +287,9 @@ export async function portProject(
     // Create target directory
     spinner.text = 'Creating target directory...';
     await fs.ensureDirectory(target);
+    if (options.to === 'dart') {
+      await fs.removeDirectory(`${target}/src`);
+    }
 
     // Port the project
     spinner.text = 'Building import mapping...';
@@ -96,6 +307,7 @@ export async function portProject(
     let successCount = 0;
     let failCount = 0;
     const startTime = Date.now();
+    const importIssues: Array<{ file: string; issues: string[]; required: string[]; actual: string[] }> = [];
 
     for (let i = 0; i < analysis.files.length; i++) {
       const file = analysis.files[i];
@@ -109,6 +321,14 @@ export async function portProject(
           `${target}/${result.targetPath}`,
           result.content
         );
+        if (result.metadata?.importIssues && result.metadata.importIssues.length > 0) {
+          importIssues.push({
+            file: result.targetPath,
+            issues: result.metadata.importIssues,
+            required: result.metadata.requiredImports ?? [],
+            actual: result.metadata.actualImports ?? [],
+          });
+        }
         fileSpinner.succeed(`${progress} ${file.relativePath} → ${result.targetPath}`);
         successCount++;
       } catch (error) {
@@ -148,6 +368,34 @@ export async function portProject(
 
     console.log(chalk.cyan(`\n📦 Generated: ${generatedFiles.join(', ')}`));
 
+    if (options.to === 'dart') {
+      const reportPath = `${target}/morphie-import-report.txt`;
+      const markdownPath = `${target}/morphie-import-report.md`;
+      const reportText = buildImportReport(importIssues);
+      const reportMarkdown = buildImportReportMarkdown(importIssues);
+      await fs.writeFile(reportPath, reportText);
+      await fs.writeFile(markdownPath, reportMarkdown);
+      console.log(chalk.gray(`Import report: ${reportPath}`));
+    }
+
+    if (options.dartAnalyze && options.to === 'dart') {
+      const reportPath = options.dartAnalyzeReport ?? `${target}/morphie-dart-analyze.txt`;
+      const markdownPath = options.dartAnalyzeMd ?? `${target}/morphie-dart-analyze.md`;
+      const topIssues = parsePositiveInt(options.dartAnalyzeTop, 10);
+      const analyzeOk = await runDartAnalyze(
+        target,
+        reportPath,
+        markdownPath,
+        fs,
+        options.dartAnalyzeFailOnWarnings ?? false,
+        topIssues,
+        options.verbose
+      );
+      if (!analyzeOk) {
+        process.exitCode = 1;
+      }
+    }
+
     console.log(chalk.green(`\n✅ Porting completed in ${formatTime(totalTime)}!`));
     console.log(`  Success: ${chalk.green(successCount)}`);
     console.log(`  Failed: ${chalk.red(failCount)}`);
@@ -160,4 +408,71 @@ export async function portProject(
     }
     process.exit(1);
   }
+}
+
+function buildImportReport(
+  issues: Array<{ file: string; issues: string[]; required: string[]; actual: string[] }>
+): string {
+  if (issues.length === 0) {
+    return 'No import issues found.';
+  }
+
+  const lines: string[] = [];
+  for (const entry of issues) {
+    lines.push(`File: ${entry.file}`);
+    lines.push('Issues:');
+    for (const issue of entry.issues) {
+      lines.push(`- ${issue}`);
+    }
+    if (entry.required.length > 0) {
+      lines.push('Required Imports:');
+      for (const req of entry.required) {
+        lines.push(`- ${req}`);
+      }
+    }
+    if (entry.actual.length > 0) {
+      lines.push('Actual Imports:');
+      for (const actual of entry.actual) {
+        lines.push(`- ${actual}`);
+      }
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n').trim();
+}
+
+function buildImportReportMarkdown(
+  issues: Array<{ file: string; issues: string[]; required: string[]; actual: string[] }>
+): string {
+  if (issues.length === 0) {
+    return '# Import Validation Report\n\nNo import issues found.\n';
+  }
+
+  const sections: string[] = ['# Import Validation Report', ''];
+  for (const entry of issues) {
+    sections.push(`## ${entry.file}`);
+    sections.push('');
+    sections.push('**Issues**');
+    for (const issue of entry.issues) {
+      sections.push(`- ${issue}`);
+    }
+    if (entry.required.length > 0) {
+      sections.push('');
+      sections.push('**Required Imports**');
+      for (const req of entry.required) {
+        sections.push(`- ${req}`);
+      }
+    }
+    if (entry.actual.length > 0) {
+      sections.push('');
+      sections.push('**Actual Imports**');
+      for (const actual of entry.actual) {
+        sections.push(`- ${actual}`);
+      }
+    }
+    sections.push('');
+  }
+
+  return sections.join('\n');
 }
