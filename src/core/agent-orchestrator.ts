@@ -53,6 +53,7 @@ export class AgentOrchestrator {
     private lastImportIssueFiles?: string[];
     private refineAttempts = 0;
     private lastPortedFiles?: PortedFile[];
+    private lastEmptyResponseFiles?: string[];
 
     constructor(
         llm: OllamaClient,
@@ -410,6 +411,7 @@ Respond with ONLY the JSON object.
                     if (task.targetLanguage === 'dart') {
                         await this.writeImportReport(task, portedFiles);
                     }
+                    await this.writeEmptyResponseReport(task);
                     break;
 
                 case 'Verification':
@@ -602,6 +604,13 @@ Respond with ONLY the JSON object.
                         this.session.phase = 'porting';
                         await this.sessionManager.save(this.sessionPath, this.session);
                     }
+
+                    if ((result.error || '').includes('Empty response from LLM')) {
+                        if (!this.lastEmptyResponseFiles) {
+                            this.lastEmptyResponseFiles = [];
+                        }
+                        this.lastEmptyResponseFiles.push(file.relativePath);
+                    }
                 }
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : String(error);
@@ -619,6 +628,13 @@ Respond with ONLY the JSON object.
                     });
                     this.session.phase = 'porting';
                     await this.sessionManager.save(this.sessionPath, this.session);
+                }
+
+                if (errorMessage.includes('Empty response from LLM')) {
+                    if (!this.lastEmptyResponseFiles) {
+                        this.lastEmptyResponseFiles = [];
+                    }
+                    this.lastEmptyResponseFiles.push(file.relativePath);
                 }
             }
         }
@@ -1041,6 +1057,28 @@ Respond with ONLY the JSON object.
         const reportMarkdown = this.buildImportReportMarkdown(issues);
         await this.fs.writeFile(reportPath, reportText);
         await this.fs.writeFile(markdownPath, reportMarkdown);
+    }
+
+    private async writeEmptyResponseReport(task: PortingTask): Promise<void> {
+        if (task.dryRun || !this.lastEmptyResponseFiles || this.lastEmptyResponseFiles.length === 0) {
+            return;
+        }
+
+        const reportPath = `${task.targetPath}/morphie-empty-response.txt`;
+        const markdownPath = `${task.targetPath}/morphie-empty-response.md`;
+        const lines = [
+            'Empty response files:',
+            ...this.lastEmptyResponseFiles.map(file => `- ${file}`),
+        ];
+        const markdownLines = [
+            '# Empty Response Report',
+            '',
+            ...this.lastEmptyResponseFiles.map(file => `- ${file}`),
+            '',
+        ];
+
+        await this.fs.writeFile(reportPath, lines.join('\n'));
+        await this.fs.writeFile(markdownPath, markdownLines.join('\n'));
     }
 
     private buildImportReport(

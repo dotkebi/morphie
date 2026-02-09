@@ -109,11 +109,12 @@ export class PortingEngine {
       };
     }
 
-    const maxAttempts = this.targetLanguage === 'dart' ? 2 : 1;
+    const maxAttempts = this.targetLanguage === 'dart' ? 4 : 3;
     let portedContent = '';
     let importIssues: string[] = [];
     let requiredImports: string[] = [];
     let actualImports: string[] = [];
+    let lastError: string | null = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       let prompt = this.buildPortingPrompt(file);
@@ -131,13 +132,17 @@ export class PortingEngine {
       });
 
       if (!response || response.trim() === '') {
-        throw new Error('Empty response from LLM');
+        lastError = 'Empty response from LLM';
+        await this.sleep(this.getBackoffMs(attempt));
+        continue;
       }
 
       portedContent = this.extractCode(response);
 
       if (!portedContent || portedContent.trim() === '') {
-        throw new Error('Failed to extract code from LLM response');
+        lastError = 'Failed to extract code from LLM response';
+        await this.sleep(this.getBackoffMs(attempt));
+        continue;
       }
 
       // Remove self-imports (import statements that reference the current file)
@@ -164,6 +169,10 @@ export class PortingEngine {
       }
     }
 
+    if (!portedContent || portedContent.trim() === '') {
+      throw new Error(lastError ?? 'Failed to port file');
+    }
+
     // Verify that all exports are included
     const missingExports = this.verifyExports(file, portedContent);
     if (missingExports.length > 0 && this.verbose) {
@@ -182,6 +191,18 @@ export class PortingEngine {
         }
         : undefined,
     };
+  }
+
+  private getBackoffMs(attempt: number): number {
+    if (attempt <= 1) return 0;
+    if (attempt === 2) return 2000;
+    if (attempt === 3) return 5000;
+    return 10000;
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    if (ms <= 0) return;
+    await new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**

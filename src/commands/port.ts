@@ -195,7 +195,9 @@ export async function portProject(
   try {
     const sessionManager = new SessionManager();
     const sessionPath = `${target}/.morphie/session.json`;
-    const existingSession = options.resume ? await sessionManager.load(sessionPath) : null;
+    const loadedSession = await sessionManager.load(sessionPath);
+    const shouldResume = options.resume !== false && loadedSession !== null;
+    const existingSession = shouldResume ? loadedSession : null;
     if (options.resume && !existingSession) {
       spinner.fail('Resume requested but no session found.');
       process.exit(1);
@@ -229,6 +231,15 @@ export async function portProject(
       spinner.fail('Cannot connect to Ollama. Make sure Ollama is running.');
       process.exit(1);
     }
+
+    const initialSession = existingSession ?? sessionManager.createInitial(
+      source,
+      target,
+      options.from,
+      options.to,
+      options.model
+    );
+    await sessionManager.save(sessionPath, initialSession);
 
     // Use Agent mode by default (can be disabled with --no-agent)
     if (options.agent !== false) {
@@ -264,7 +275,7 @@ export async function portProject(
         dartAnalyzeInfoThreshold: options.dartAnalyzeInfoThreshold !== undefined
           ? parseNonNegativeInt(options.dartAnalyzeInfoThreshold, 0)
           : undefined,
-        resume: options.resume,
+        resume: shouldResume,
         sessionPath,
         refreshUnderstanding: options.refreshUnderstanding,
       });
@@ -394,6 +405,10 @@ export async function portProject(
         });
         session.phase = 'porting';
         await sessionManager.save(sessionPath, session);
+
+        if ((error instanceof Error ? error.message : String(error)).includes('Empty response from LLM')) {
+          await appendEmptyResponse(target, file.relativePath, fs);
+        }
       }
 
       // Show ETA every 10 files
@@ -539,6 +554,28 @@ function buildImportReportMarkdown(
   }
 
   return sections.join('\n');
+}
+
+async function appendEmptyResponse(target: string, file: string, fs: FileSystem): Promise<void> {
+  const reportPath = `${target}/morphie-empty-response.txt`;
+  const markdownPath = `${target}/morphie-empty-response.md`;
+  const line = `- ${file}`;
+
+  let existing = '';
+  if (await fs.fileExists(reportPath)) {
+    existing = await fs.readFile(reportPath);
+  }
+  const updated = existing ? `${existing.trim()}\n${line}\n` : `Empty response files:\n${line}\n`;
+  await fs.writeFile(reportPath, updated);
+
+  let existingMd = '';
+  if (await fs.fileExists(markdownPath)) {
+    existingMd = await fs.readFile(markdownPath);
+  }
+  const updatedMd = existingMd
+    ? `${existingMd.trim()}\n${line}\n`
+    : `# Empty Response Report\n\n${line}\n`;
+  await fs.writeFile(markdownPath, updatedMd);
 }
 
 async function postProcessDartProject(
