@@ -77,6 +77,8 @@ class AdaptiveSemaphore {
     }
 }
 
+type TestMode = 'mixed' | 'defer' | 'only' | 'skip';
+
 export class AgentOrchestrator {
     private llm: OllamaClient;
     private conversation: ConversationManager;
@@ -582,9 +584,11 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         // Port each file
         const completed = new Set(this.session?.completedFiles ?? []);
         const fileHashes = this.session?.fileHashes ?? {};
+        const testMode = (task.testMode ?? 'mixed') as TestMode;
+        const baseFiles = this.selectFilesByTestMode(projectAnalysis.files, testMode);
         const filesToPort = onlyFiles
-            ? projectAnalysis.files.filter(file => onlyFiles.has(file.relativePath))
-            : projectAnalysis.files;
+            ? baseFiles.filter(file => onlyFiles.has(file.relativePath))
+            : baseFiles;
         const totalToPort = filesToPort.length;
         const baseConcurrency = Math.max(1, task.concurrency ?? 4);
         const autoConcurrency = task.autoConcurrency !== false;
@@ -723,6 +727,23 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
             files: portedFiles,
             errors,
         };
+    }
+
+    private selectFilesByTestMode<T extends { type: string }>(files: T[], mode: TestMode): T[] {
+        const testFiles = files.filter(file => file.type === 'test');
+        const nonTestFiles = files.filter(file => file.type !== 'test');
+
+        switch (mode) {
+            case 'defer':
+                return [...nonTestFiles, ...testFiles];
+            case 'only':
+                return testFiles;
+            case 'skip':
+                return nonTestFiles;
+            case 'mixed':
+            default:
+                return files;
+        }
     }
 
     private async generateProjectFilesIfNeeded(task: PortingTask): Promise<void> {

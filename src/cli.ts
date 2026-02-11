@@ -40,6 +40,7 @@ program
   .option('--refresh-understanding', 'Recompute agent understanding even when resuming')
   .option('--concurrency <count>', 'Number of files to port in parallel', '4')
   .option('--no-auto-concurrency', 'Disable adaptive concurrency')
+  .option('--test-mode <mode>', 'How to port test files: mixed|defer|only|skip', 'mixed')
   .action(portProject);
 
 program

@@ -45,7 +45,10 @@ interface PortOptions {
   refreshUnderstanding?: boolean;
   concurrency?: string;
   autoConcurrency?: boolean;
+  testMode?: string;
 }
+
+type TestMode = 'mixed' | 'defer' | 'only' | 'skip';
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
@@ -61,6 +64,31 @@ function parseNonNegativeInt(value: string | undefined, fallback: number): numbe
     return fallback;
   }
   return Math.floor(parsed);
+}
+
+function parseTestMode(value: string | undefined): TestMode {
+  const mode = (value ?? 'mixed').toLowerCase();
+  if (mode === 'mixed' || mode === 'defer' || mode === 'only' || mode === 'skip') {
+    return mode;
+  }
+  throw new Error(`Invalid --test-mode: ${value}. Use one of: mixed, defer, only, skip.`);
+}
+
+function selectFilesByTestMode<T extends { type: string }>(files: T[], mode: TestMode): T[] {
+  const testFiles = files.filter(file => file.type === 'test');
+  const nonTestFiles = files.filter(file => file.type !== 'test');
+
+  switch (mode) {
+    case 'defer':
+      return [...nonTestFiles, ...testFiles];
+    case 'only':
+      return testFiles;
+    case 'skip':
+      return nonTestFiles;
+    case 'mixed':
+    default:
+      return files;
+  }
 }
 
 const execFileAsync = promisify(execFile);
@@ -196,6 +224,7 @@ export async function portProject(
   const spinner = ora('Initializing...').start();
 
   try {
+    const testMode = parseTestMode(options.testMode);
     const sessionManager = new SessionManager();
     const sessionPath = `${target}/.morphie/session.json`;
     const loadedSession = await sessionManager.load(sessionPath);
@@ -286,6 +315,7 @@ export async function portProject(
         refreshUnderstanding: options.refreshUnderstanding,
         concurrency: parsePositiveInt(options.concurrency, 4),
         autoConcurrency: options.autoConcurrency,
+        testMode,
       });
 
       if (result.success) {
@@ -366,7 +396,8 @@ export async function portProject(
 
     spinner.stop();
 
-    const totalFiles = analysis.files.length;
+    const selectedFiles = selectFilesByTestMode(analysis.files, testMode);
+    const totalFiles = selectedFiles.length;
     console.log(chalk.cyan(`\nPorting ${totalFiles} files:\n`));
 
     let successCount = 0;
@@ -379,7 +410,7 @@ export async function portProject(
     const autoConcurrency = options.autoConcurrency !== false;
     const semaphore = new AdaptiveSemaphore(baseConcurrency);
     let processed = 0;
-    const files = analysis.files;
+    const files = selectedFiles;
 
     const tasks = files.map(async file => {
       const contentHash = crypto.createHash('sha256').update(file.content).digest('hex');
