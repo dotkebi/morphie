@@ -1,3 +1,6 @@
+import http from 'http';
+import https from 'https';
+
 export interface OllamaModel {
   name: string;
   size?: number;
@@ -60,52 +63,7 @@ export class OllamaClient {
 
     console.log(`[Ollama Debug] Generating with model: ${this.model}`);
     console.log(`[Ollama Debug] Prompt length: ${prompt.length}`);
-
-    const response = await fetch(`${this.baseUrl}/api/generate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: this.model,
-        prompt,
-        stream: false,
-        options: {
-          temperature: opts.temperature,
-          top_p: opts.topP,
-          num_predict: opts.maxTokens,
-        },
-      }),
-    });
-
-    console.log(`[Ollama Debug] Response Status: ${response.status} ${response.statusText}`);
-
-    if (!response.ok) {
-      const error = await response.text();
-      console.error(`[Ollama Debug] Error Body: ${error}`);
-      throw new Error(`Ollama generation failed: ${error}`);
-    }
-
-    const responseText = await response.text();
-    console.log(`[Ollama Debug] Response Body length: ${responseText.length}`);
-    
-    if (responseText.length < 2000) {
-      console.log(`[Ollama Debug] Response Body: ${responseText}`);
-    } else {
-      console.log(`[Ollama Debug] Response Body (first 500 chars): ${responseText.substring(0, 500)}...`);
-      console.log(`[Ollama Debug] Response Body (last 500 chars): ...${responseText.substring(responseText.length - 500)}`);
-    }
-
-    try {
-      const data = JSON.parse(responseText) as { response?: string };
-      if (!data.response) {
-        console.warn(`[Ollama Debug] WARNING: Empty 'response' field in JSON.`);
-      }
-      return data.response || '';
-    } catch (e) {
-      console.error(`[Ollama Debug] JSON Parse Error: ${e}`);
-      throw e;
-    }
+    return this.fetchGenerateStream(prompt, opts, () => {});
   }
 
   async generateStream(
@@ -114,61 +72,112 @@ export class OllamaClient {
     options?: GenerateOptions
   ): Promise<string> {
     const opts = { ...this.defaultOptions, ...options };
+    return this.fetchGenerateStream(prompt, opts, onToken);
+  }
 
-    const response = await fetch(`${this.baseUrl}/api/generate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
+  private async fetchGenerateStream(
+    prompt: string,
+    opts: GenerateOptions,
+    onToken: (token: string) => void
+  ): Promise<string> {
+    const requestUrl = new URL(`${this.baseUrl}/api/generate`);
+    const client = requestUrl.protocol === 'https:' ? https : http;
+    const payload = JSON.stringify({
+      model: this.model,
+      prompt,
+      stream: true,
+      options: {
+        temperature: opts.temperature,
+        top_p: opts.topP,
+        num_predict: opts.maxTokens,
       },
-      body: JSON.stringify({
-        model: this.model,
-        prompt,
-        stream: true,
-        options: {
-          temperature: opts.temperature,
-          top_p: opts.topP,
-          num_predict: opts.maxTokens,
-        },
-      }),
     });
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Ollama generation failed: ${error}`);
-    }
+    return await new Promise<string>((resolve, reject) => {
+      const req = client.request(
+        {
+          method: 'POST',
+          protocol: requestUrl.protocol,
+          hostname: requestUrl.hostname,
+          port: requestUrl.port || (requestUrl.protocol === 'https:' ? 443 : 80),
+          path: `${requestUrl.pathname}${requestUrl.search}`,
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+          },
+        },
+        (res) => {
+          let fullResponse = '';
+          let buffer = '';
+          let errorBody = '';
 
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error('No response body');
-    }
+          res.setEncoding('utf8');
 
-    const decoder = new TextDecoder();
-    let fullResponse = '';
-
-    let done = false;
-    while (!done) {
-      const result = await reader.read();
-      done = result.done;
-      const value = result.value;
-      if (done) break;
-
-      const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split('\n').filter(line => line.trim());
-
-      for (const line of lines) {
-        try {
-          const data = JSON.parse(line) as { response?: string; done?: boolean };
-          if (data.response) {
-            onToken(data.response);
-            fullResponse += data.response;
+          if ((res.statusCode ?? 500) >= 400) {
+            res.on('data', (chunk: string) => {
+              errorBody += chunk;
+            });
+            res.on('end', () => {
+              reject(new Error(`Ollama generation failed: ${errorBody || `HTTP ${res.statusCode}`}`));
+            });
+            return;
           }
-        } catch {
-          // Ignore parse errors for incomplete JSON
-        }
-      }
-    }
 
-    return fullResponse;
+          res.on('data', (chunk: string) => {
+            buffer += chunk;
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+
+            for (const line of lines) {
+              if (!line.trim()) {
+                continue;
+              }
+              try {
+                const data = JSON.parse(line) as { response?: string; error?: string };
+                if (data.error) {
+                  reject(new Error(`Ollama generation failed: ${data.error}`));
+                  req.destroy();
+                  return;
+                }
+                if (data.response) {
+                  onToken(data.response);
+                  fullResponse += data.response;
+                }
+              } catch {
+                // Ignore parse errors for incomplete JSON lines
+              }
+            }
+          });
+
+          res.on('end', () => {
+            if (buffer.trim()) {
+              try {
+                const data = JSON.parse(buffer) as { response?: string; error?: string };
+                if (data.error) {
+                  reject(new Error(`Ollama generation failed: ${data.error}`));
+                  return;
+                }
+                if (data.response) {
+                  onToken(data.response);
+                  fullResponse += data.response;
+                }
+              } catch {
+                // Ignore trailing malformed data
+              }
+            }
+            resolve(fullResponse);
+          });
+        }
+      );
+
+      req.setTimeout(0);
+      req.on('error', (err: NodeJS.ErrnoException) => {
+        console.error(`[Ollama Debug] Request error: ${err.message}${err.code ? ` (code: ${err.code})` : ''}`);
+        reject(err);
+      });
+      req.write(payload);
+      req.end();
+    });
   }
 
   setModel(model: string): void {
