@@ -33,6 +33,14 @@ export interface PortedFile {
   };
 }
 
+export interface PortingPromptOptions {
+  overrideContent?: string;
+  chunked?: boolean;
+  chunkIndex?: number;
+  totalChunks?: number;
+  suppressImports?: boolean;
+}
+
 export class PortingEngine {
   private llm: OllamaClient;
   private sourceLanguage: string;
@@ -40,6 +48,7 @@ export class PortingEngine {
   private verbose: boolean;
   private projectName: string;
   private importMapping: ImportMapping;
+  private promptMode: 'full' | 'reduced' | 'minimal';
 
   constructor(
     llm: OllamaClient,
@@ -60,6 +69,27 @@ export class PortingEngine {
       simpleNameToLocations: new Map(),
       sourcePathToTargetPath: new Map(),
     };
+    this.promptMode = 'full';
+  }
+
+  setPromptMode(mode: 'full' | 'reduced' | 'minimal'): void {
+    this.promptMode = mode;
+  }
+
+  public getTargetPath(sourcePath: string): string {
+    return this.convertFilePath(sourcePath);
+  }
+
+  estimatePromptTokens(
+    file: SourceFile,
+    options: PortingPromptOptions = {}
+  ): number {
+    const prompt = this.buildPortingPrompt(file, options);
+    return this.estimateTokens(prompt);
+  }
+
+  private estimateTokens(text: string): number {
+    return Math.ceil(text.length / 4);
   }
 
   buildImportMapping(files: SourceFile[]): void {
@@ -97,7 +127,17 @@ export class PortingEngine {
   }
 
   async portFile(file: SourceFile): Promise<PortedFile> {
+    return this.portFileWithOptions(file, {});
+  }
+
+  async portFileWithOptions(
+    file: SourceFile,
+    options: PortingPromptOptions = {}
+  ): Promise<PortedFile> {
     const targetPath = this.convertFilePath(file.relativePath);
+    const workingFile = options.overrideContent
+      ? { ...file, content: options.overrideContent }
+      : file;
 
     // Handle barrel files (index.ts) differently for Dart
     if (file.type === 'barrel' && this.targetLanguage === 'dart' && file.exports.length === 0) {
@@ -117,9 +157,9 @@ export class PortingEngine {
     let lastError: string | null = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      let prompt = this.buildPortingPrompt(file);
+      let prompt = this.buildPortingPrompt(workingFile, options);
 
-      if (this.targetLanguage === 'dart' && attempt > 1) {
+      if (this.targetLanguage === 'dart' && attempt > 1 && !options.suppressImports) {
         requiredImports = this.getRequiredDartImports(file, targetPath);
         if (requiredImports.length > 0) {
           prompt += `\n\n## Import Correction (CRITICAL)\nYou MUST include the exact import statements below:\n${requiredImports.join('\n')}\n`;
@@ -153,15 +193,19 @@ export class PortingEngine {
       if (this.targetLanguage === 'dart') {
         portedContent = this.enforceDartRequiredNamedParams(portedContent);
         portedContent = this.enforceDartExportedConstNames(portedContent, file);
-        portedContent = this.ensureDartRequiredImports(portedContent, file);
-        portedContent = this.normalizeDartImports(portedContent, file);
+        if (!options.suppressImports) {
+          portedContent = this.ensureDartRequiredImports(portedContent, file);
+          portedContent = this.normalizeDartImports(portedContent, file);
 
-        const validation = this.validateDartImports(portedContent, file, targetPath);
-        importIssues = validation.issues;
-        requiredImports = validation.requiredImports;
-        actualImports = validation.actualImports;
+          const validation = this.validateDartImports(portedContent, file, targetPath);
+          importIssues = validation.issues;
+          requiredImports = validation.requiredImports;
+          actualImports = validation.actualImports;
 
-        if (importIssues.length === 0) {
+          if (importIssues.length === 0) {
+            break;
+          }
+        } else {
           break;
         }
       } else {
@@ -174,9 +218,11 @@ export class PortingEngine {
     }
 
     // Verify that all exports are included
-    const missingExports = this.verifyExports(file, portedContent);
-    if (missingExports.length > 0 && this.verbose) {
-      console.warn(`⚠️  Warning: Missing exports in ${file.relativePath}: ${missingExports.join(', ')}`);
+    if (!options.chunked) {
+      const missingExports = this.verifyExports(file, portedContent);
+      if (missingExports.length > 0 && this.verbose) {
+        console.warn(`⚠️  Warning: Missing exports in ${file.relativePath}: ${missingExports.join(', ')}`);
+      }
     }
 
     return {
@@ -616,12 +662,24 @@ export class PortingEngine {
     return result.slice(0, 10); // Limit to avoid too long prompts
   }
 
-  private buildPortingPrompt(file: SourceFile): string {
+  private buildPortingPrompt(file: SourceFile, options: PortingPromptOptions = {}): string {
+    if (this.promptMode === 'minimal') {
+      return this.buildMinimalPrompt(file, options);
+    }
+
     const sourceFeatures = getLanguageFeatures(this.sourceLanguage);
     const targetFeatures = getLanguageFeatures(this.targetLanguage);
-    const importContext = this.buildImportContext(file);
+    const importContext = options.suppressImports ? '' : this.buildImportContext(file);
+    const chunkNotice = options.chunked
+      ? `## Chunked Porting (CRITICAL)
+You are porting chunk ${options.chunkIndex! + 1} of ${options.totalChunks!} from a larger file.
+- Output ONLY the code for this chunk, in correct order.
+- Do NOT add extra commentary.
+- ${options.suppressImports ? 'Do NOT include any import statements in this chunk.' : 'Include necessary import statements only if they belong at the top of the file.'}
+`
+      : '';
 
-    return `You are an expert software engineer performing a 1:1 code port from ${this.sourceLanguage} to ${this.targetLanguage}.
+    const fullPrompt = `You are an expert software engineer performing a 1:1 code port from ${this.sourceLanguage} to ${this.targetLanguage}.
 
 ## Task
 Convert the following ${this.sourceLanguage} code to idiomatic ${this.targetLanguage} code while preserving:
@@ -653,6 +711,8 @@ ${targetFeatures}
 12. **CRITICAL: Include ALL methods, including private methods** - If a class has \`private addListener(...)\` in TypeScript, you MUST include it as \`void _addListener(...)\` in Dart (Dart uses underscore prefix for private). Do NOT skip any methods, whether public or private.
 
 ${importContext}
+
+${chunkNotice}
 
 ## Dart Constructor & Constant Rules (CRITICAL)
 1. **Named Parameters Validation**:
@@ -932,6 +992,80 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
    - Interfaces/Types next (if any) - but NO "// Interfaces/Types" comment
    - Classes last - but NO "// Classes" comment
    - Functions only if they are top-level exports (not class methods) - but NO "// Functions" comment`;
+    if (this.promptMode === 'reduced') {
+      return this.buildReducedPrompt(file, importContext, sourceFeatures, targetFeatures);
+    }
+
+    return fullPrompt;
+  }
+
+  private buildReducedPrompt(
+    file: SourceFile,
+    importContext: string,
+    sourceFeatures: string,
+    targetFeatures: string
+  ): string {
+    return `You are an expert software engineer performing a 1:1 code port from ${this.sourceLanguage} to ${this.targetLanguage}.
+
+## Task
+Convert the following ${this.sourceLanguage} code to idiomatic ${this.targetLanguage} code while preserving:
+- Exact functionality and behavior
+- Code structure and organization
+- Function/method signatures
+- Comments and documentation
+- **CRITICAL: Include ALL methods, including private methods**
+- **CRITICAL: Do NOT add organizational comments**
+
+## Source Language Features
+${sourceFeatures}
+
+## Target Language Features
+${targetFeatures}
+
+## Guidelines
+1. Maintain the same logic and algorithm
+2. Use equivalent data structures in the target language
+3. Handle error cases the same way (adapted to target language patterns)
+4. Preserve any TODO comments or notes
+5. Use idiomatic patterns for the target language
+6. Include necessary imports/dependencies
+7. **CRITICAL: NEVER import the current file itself**
+8. **CRITICAL: Keep all definitions in the same file**
+9. **CRITICAL: Include non-exported interfaces/types**
+10. **CRITICAL: Do NOT convert string types to enums**
+11. **CRITICAL: Type aliases are NOT enums**
+12. **CRITICAL: Include ALL methods, including private methods**
+
+${importContext}
+
+## Source Code
+\`\`\`${this.sourceLanguage}
+${file.content}
+\`\`\`
+
+## Output
+Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.`;
+  }
+
+  private buildMinimalPrompt(file: SourceFile, options: PortingPromptOptions = {}): string {
+    const importContext = options.suppressImports ? '' : this.buildImportContext(file);
+    const sourceContent = file.content;
+    const chunkNotice = options.chunked
+      ? `\nChunk ${options.chunkIndex! + 1} of ${options.totalChunks!}. ${options.suppressImports ? 'Do NOT include imports.' : 'Include imports only if appropriate at top of file.'}\n`
+      : '';
+    return `Port this ${this.sourceLanguage} code to ${this.targetLanguage}.
+Preserve behavior, structure, signatures, and comments.
+Include all definitions and methods (including private).
+Do not add extra commentary. Output only code in a code block.
+
+${importContext}
+
+${chunkNotice}
+
+Source:
+\`\`\`${this.sourceLanguage}
+${sourceContent}
+\`\`\``;
   }
 
   private extractCode(response: string): string {

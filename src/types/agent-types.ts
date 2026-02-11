@@ -28,6 +28,8 @@ export interface PortingTask {
   resume?: boolean;
   sessionPath?: string;
   refreshUnderstanding?: boolean;
+  concurrency?: number;
+  autoConcurrency?: boolean;
 }
 
 export interface TaskUnderstanding {

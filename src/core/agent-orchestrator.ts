@@ -15,6 +15,7 @@ import { FileSystem } from '../utils/filesystem.js';
 import { addDartDependencies, generateProjectFiles } from '../utils/project-config.js';
 import { SessionManager, type PortingSession } from '../utils/session.js';
 import path from 'path';
+import crypto from 'crypto';
 import type {
     PortingTask,
     PortingResult,
@@ -30,6 +31,51 @@ import type {
     QualityIssue,
 } from '../types/agent-types.js';
 import type { ProjectAnalysis } from './analyzer.js';
+
+class AdaptiveSemaphore {
+    private limit: number;
+    private active = 0;
+    private waiters: Array<() => void> = [];
+
+    constructor(limit: number) {
+        this.limit = Math.max(1, limit);
+    }
+
+    getLimit(): number {
+        return this.limit;
+    }
+
+    setLimit(limit: number): void {
+        this.limit = Math.max(1, limit);
+        while (this.waiters.length > 0 && this.active < this.limit) {
+            const next = this.waiters.shift();
+            if (next) {
+                next();
+            }
+        }
+    }
+
+    async acquire(): Promise<void> {
+        if (this.active < this.limit) {
+            this.active += 1;
+            return;
+        }
+        await new Promise<void>(resolve => {
+            this.waiters.push(() => resolve());
+        });
+        this.active += 1;
+    }
+
+    release(): void {
+        this.active = Math.max(0, this.active - 1);
+        if (this.waiters.length > 0 && this.active < this.limit) {
+            const next = this.waiters.shift();
+            if (next) {
+                next();
+            }
+        }
+    }
+}
 
 export class AgentOrchestrator {
     private llm: OllamaClient;
@@ -247,7 +293,7 @@ Provide your analysis in JSON format:
   "complexity": "low|medium|high"
 }
 
-Respond with ONLY the JSON object.
+Respond with ONLY a valid JSON object. Do not include any explanations, preamble, or postscript. Do not use markdown code blocks.
 `;
 
         try {
@@ -485,6 +531,9 @@ Respond with ONLY the JSON object.
             };
             this.session.totalFiles = this.projectAnalysis.files.length;
             this.session.phase = 'analysis';
+            if (!this.session.fileHashes) {
+                this.session.fileHashes = {};
+            }
             await this.sessionManager.save(this.sessionPath, this.session);
         }
     }
@@ -500,7 +549,8 @@ Respond with ONLY the JSON object.
         files: PortedFile[];
         errors: PortingError[];
     }> {
-        if (!this.projectAnalysis) {
+        const projectAnalysis = this.projectAnalysis;
+        if (!projectAnalysis) {
             throw new Error('Analysis must be completed before porting');
         }
 
@@ -523,7 +573,7 @@ Respond with ONLY the JSON object.
             this.verbose,
             task.targetPath.split('/').pop() || 'project'
         );
-        engine.buildImportMapping(this.projectAnalysis.files);
+        engine.buildImportMapping(projectAnalysis.files);
 
         if (!task.dryRun && task.targetLanguage === 'dart') {
             await this.fs.removeDirectory(`${task.targetPath}/src`);
@@ -531,15 +581,24 @@ Respond with ONLY the JSON object.
 
         // Port each file
         const completed = new Set(this.session?.completedFiles ?? []);
+        const fileHashes = this.session?.fileHashes ?? {};
         const filesToPort = onlyFiles
-            ? this.projectAnalysis.files.filter(file => onlyFiles.has(file.relativePath))
-            : this.projectAnalysis.files.filter(file => !completed.has(file.relativePath));
+            ? projectAnalysis.files.filter(file => onlyFiles.has(file.relativePath))
+            : projectAnalysis.files;
         const totalToPort = filesToPort.length;
+        const baseConcurrency = Math.max(1, task.concurrency ?? 4);
+        const autoConcurrency = task.autoConcurrency !== false;
+        const semaphore = new AdaptiveSemaphore(baseConcurrency);
+        let processed = 0;
 
-        for (let i = 0; i < totalToPort; i++) {
-            const file = filesToPort[i];
-            const progress = `[${i + 1}/${totalToPort}]`;
+        const tasks = filesToPort.map(async file => {
+            const contentHash = crypto.createHash('sha256').update(file.content).digest('hex');
+            if (completed.has(file.relativePath) && fileHashes[file.relativePath] === contentHash) {
+                return;
+            }
 
+            await semaphore.acquire();
+            const progress = `[${processed + 1}/${totalToPort}]`;
             this.log(`  ${progress} Porting ${file.relativePath}...`);
 
             try {
@@ -548,7 +607,7 @@ Respond with ONLY the JSON object.
                     sourceLanguage: task.sourceLanguage,
                     targetLanguage: task.targetLanguage,
                     projectName: task.targetPath.split('/').pop() || 'project',
-                    allFiles: this.projectAnalysis.files,
+                    allFiles: projectAnalysis.files,
                     verbose: this.verbose,
                 });
 
@@ -563,7 +622,6 @@ Respond with ONLY the JSON object.
                         metadata: ported.metadata,
                     });
 
-                    // Write file immediately if not dry run
                     if (!task.dryRun) {
                         await this.fs.writeFile(
                             `${task.targetPath}/${ported.targetPath}`,
@@ -584,7 +642,9 @@ Respond with ONLY the JSON object.
 
                     if (this.session && this.sessionPath) {
                         completed.add(file.relativePath);
+                        fileHashes[file.relativePath] = contentHash;
                         this.session.completedFiles = Array.from(completed);
+                        this.session.fileHashes = fileHashes;
                         this.session.phase = 'porting';
                         await this.sessionManager.save(this.sessionPath, this.session);
                     }
@@ -610,6 +670,9 @@ Respond with ONLY the JSON object.
                             this.lastEmptyResponseFiles = [];
                         }
                         this.lastEmptyResponseFiles.push(file.relativePath);
+                        if (autoConcurrency && semaphore.getLimit() > 1) {
+                            semaphore.setLimit(semaphore.getLimit() - 1);
+                        }
                     }
                 }
             } catch (error) {
@@ -635,9 +698,17 @@ Respond with ONLY the JSON object.
                         this.lastEmptyResponseFiles = [];
                     }
                     this.lastEmptyResponseFiles.push(file.relativePath);
+                    if (autoConcurrency && semaphore.getLimit() > 1) {
+                        semaphore.setLimit(semaphore.getLimit() - 1);
+                    }
                 }
+            } finally {
+                processed += 1;
+                semaphore.release();
             }
-        }
+        });
+
+        await Promise.all(tasks);
 
         this.lastPortedFiles = portedFiles;
         if (portedFiles.some(file => file.metadata?.importIssues?.length)) {
@@ -1192,12 +1263,46 @@ Respond with ONLY the JSON object.
      * Extract JSON from LLM response
      */
     private extractJSON(response: string): any {
+        // Try to find all potential JSON blocks (using balanced braces)
+        const blocks: string[] = [];
+        let braceCount = 0;
+        let startPos = -1;
+
+        for (let i = 0; i < response.length; i++) {
+            if (response[i] === '{') {
+                if (braceCount === 0) startPos = i;
+                braceCount++;
+            } else if (response[i] === '}') {
+                braceCount--;
+                if (braceCount === 0 && startPos !== -1) {
+                    blocks.push(response.substring(startPos, i + 1));
+                    startPos = -1;
+                }
+            }
+        }
+
+        // Try parsing from largest to smallest, or last to first?
+        // Usually the last block is the final result in many-turn LLM outputs
+        for (let i = blocks.length - 1; i >= 0; i--) {
+            try {
+                return JSON.parse(blocks[i]);
+            } catch {
+                // Continue to next block
+            }
+        }
+
+        // Fallback to the original greedy match if balanced brace approach failed
         const jsonMatch = response.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
             try {
                 return JSON.parse(jsonMatch[0]);
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
+                if (this.verbose) {
+                    console.error('--- FAILED JSON PARSE ---');
+                    console.error(jsonMatch[0]);
+                    console.error('--- END ---');
+                }
                 throw new Error(`Failed to parse JSON: ${message}`);
             }
         }

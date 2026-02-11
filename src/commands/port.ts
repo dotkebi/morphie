@@ -3,6 +3,7 @@ import ora from 'ora';
 import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import crypto from 'crypto';
 import { ProjectAnalyzer } from '../core/analyzer.js';
 import { PortingEngine } from '../core/porting-engine.js';
 import { AgentOrchestrator } from '../core/agent-orchestrator.js';
@@ -42,6 +43,8 @@ interface PortOptions {
   dartAnalyzeInfoThreshold?: string;
   resume?: boolean;
   refreshUnderstanding?: boolean;
+  concurrency?: string;
+  autoConcurrency?: boolean;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -239,6 +242,9 @@ export async function portProject(
       options.to,
       options.model
     );
+    if (!initialSession.fileHashes) {
+      initialSession.fileHashes = {};
+    }
     await sessionManager.save(sessionPath, initialSession);
 
     // Use Agent mode by default (can be disabled with --no-agent)
@@ -278,6 +284,8 @@ export async function portProject(
         resume: shouldResume,
         sessionPath,
         refreshUnderstanding: options.refreshUnderstanding,
+        concurrency: parsePositiveInt(options.concurrency, 4),
+        autoConcurrency: options.autoConcurrency,
       });
 
       if (result.success) {
@@ -310,6 +318,9 @@ export async function portProject(
       options.to,
       options.model
     );
+    if (!session.fileHashes) {
+      session.fileHashes = {};
+    }
     session.analysis = {
       files: analysis.files.length,
       entryPoints: analysis.entryPoints,
@@ -363,14 +374,22 @@ export async function portProject(
     const startTime = Date.now();
     const importIssues: Array<{ file: string; issues: string[]; required: string[]; actual: string[] }> = [];
     const completed = new Set(existingSession?.completedFiles ?? []);
+    const fileHashes = existingSession?.fileHashes ?? {};
+    const baseConcurrency = parsePositiveInt(options.concurrency, 4);
+    const autoConcurrency = options.autoConcurrency !== false;
+    const semaphore = new AdaptiveSemaphore(baseConcurrency);
+    let processed = 0;
+    const files = analysis.files;
 
-    for (let i = 0; i < analysis.files.length; i++) {
-      const file = analysis.files[i];
-      if (completed.has(file.relativePath)) {
-        continue;
+    const tasks = files.map(async file => {
+      const contentHash = crypto.createHash('sha256').update(file.content).digest('hex');
+      if (completed.has(file.relativePath) && fileHashes[file.relativePath] === contentHash) {
+        return;
       }
-      const progress = `[${i + 1}/${totalFiles}]`;
-      const percent = Math.round(((i + 1) / totalFiles) * 100);
+
+      await semaphore.acquire();
+      const progress = `[${processed + 1}/${totalFiles}]`;
+      const percent = Math.round(((processed + 1) / totalFiles) * 100);
       const fileSpinner = ora(`${progress} ${percent}% Porting ${file.relativePath}...`).start();
 
       try {
@@ -388,12 +407,15 @@ export async function portProject(
           });
         }
         completed.add(file.relativePath);
+        fileHashes[file.relativePath] = contentHash;
         session.completedFiles = Array.from(completed);
+        session.fileHashes = fileHashes;
         session.phase = 'porting';
         await sessionManager.save(sessionPath, session);
         fileSpinner.succeed(`${progress} ${file.relativePath} → ${result.targetPath}`);
         successCount++;
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         fileSpinner.fail(`${progress} Failed: ${file.relativePath}`);
         if (options.verbose && error instanceof Error) {
           console.log(chalk.red(`  Error: ${error.message}`));
@@ -401,24 +423,24 @@ export async function portProject(
         failCount++;
         session.failedFiles.push({
           file: file.relativePath,
-          error: error instanceof Error ? error.message : String(error),
+          error: message,
         });
         session.phase = 'porting';
         await sessionManager.save(sessionPath, session);
 
-        if ((error instanceof Error ? error.message : String(error)).includes('Empty response from LLM')) {
+        if (message.includes('Empty response from LLM')) {
           await appendEmptyResponse(target, file.relativePath, fs);
+          if (autoConcurrency && semaphore.getLimit() > 1) {
+            semaphore.setLimit(semaphore.getLimit() - 1);
+          }
         }
+      } finally {
+        processed++;
+        semaphore.release();
       }
+    });
 
-      // Show ETA every 10 files
-      if ((i + 1) % 10 === 0 && i + 1 < totalFiles) {
-        const elapsed = (Date.now() - startTime) / 1000;
-        const avgTime = elapsed / (i + 1);
-        const remaining = Math.round(avgTime * (totalFiles - i - 1));
-        console.log(chalk.gray(`  ⏱  ETA: ${formatTime(remaining)}`));
-      }
-    }
+    await Promise.all(tasks);
 
     const totalTime = Math.round((Date.now() - startTime) / 1000);
 
@@ -554,6 +576,51 @@ function buildImportReportMarkdown(
   }
 
   return sections.join('\n');
+}
+
+class AdaptiveSemaphore {
+  private limit: number;
+  private active = 0;
+  private waiters: Array<() => void> = [];
+
+  constructor(limit: number) {
+    this.limit = Math.max(1, limit);
+  }
+
+  getLimit(): number {
+    return this.limit;
+  }
+
+  setLimit(limit: number): void {
+    this.limit = Math.max(1, limit);
+    while (this.waiters.length > 0 && this.active < this.limit) {
+      const next = this.waiters.shift();
+      if (next) {
+        next();
+      }
+    }
+  }
+
+  async acquire(): Promise<void> {
+    if (this.active < this.limit) {
+      this.active += 1;
+      return;
+    }
+    await new Promise<void>(resolve => {
+      this.waiters.push(() => resolve());
+    });
+    this.active += 1;
+  }
+
+  release(): void {
+    this.active = Math.max(0, this.active - 1);
+    if (this.waiters.length > 0 && this.active < this.limit) {
+      const next = this.waiters.shift();
+      if (next) {
+        next();
+      }
+    }
+  }
 }
 
 async function appendEmptyResponse(target: string, file: string, fs: FileSystem): Promise<void> {

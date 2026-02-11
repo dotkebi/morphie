@@ -58,6 +58,9 @@ export class OllamaClient {
   async generate(prompt: string, options?: GenerateOptions): Promise<string> {
     const opts = { ...this.defaultOptions, ...options };
 
+    console.log(`[Ollama Debug] Generating with model: ${this.model}`);
+    console.log(`[Ollama Debug] Prompt length: ${prompt.length}`);
+
     const response = await fetch(`${this.baseUrl}/api/generate`, {
       method: 'POST',
       headers: {
@@ -75,13 +78,34 @@ export class OllamaClient {
       }),
     });
 
+    console.log(`[Ollama Debug] Response Status: ${response.status} ${response.statusText}`);
+
     if (!response.ok) {
       const error = await response.text();
+      console.error(`[Ollama Debug] Error Body: ${error}`);
       throw new Error(`Ollama generation failed: ${error}`);
     }
 
-    const data = await response.json() as { response?: string };
-    return data.response || '';
+    const responseText = await response.text();
+    console.log(`[Ollama Debug] Response Body length: ${responseText.length}`);
+    
+    if (responseText.length < 2000) {
+      console.log(`[Ollama Debug] Response Body: ${responseText}`);
+    } else {
+      console.log(`[Ollama Debug] Response Body (first 500 chars): ${responseText.substring(0, 500)}...`);
+      console.log(`[Ollama Debug] Response Body (last 500 chars): ...${responseText.substring(responseText.length - 500)}`);
+    }
+
+    try {
+      const data = JSON.parse(responseText) as { response?: string };
+      if (!data.response) {
+        console.warn(`[Ollama Debug] WARNING: Empty 'response' field in JSON.`);
+      }
+      return data.response || '';
+    } catch (e) {
+      console.error(`[Ollama Debug] JSON Parse Error: ${e}`);
+      throw e;
+    }
   }
 
   async generateStream(

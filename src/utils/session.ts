@@ -33,6 +33,7 @@ export interface PortingSession {
   totalFiles?: number;
   completedFiles: string[];
   failedFiles: Array<{ file: string; error: string }>;
+  fileHashes?: Record<string, string>;
 }
 
 export class SessionManager {

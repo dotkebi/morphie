@@ -38,6 +38,8 @@ program
   .option('--resume', 'Resume from last session in <target>/.morphie/session.json')
   .option('--no-resume', 'Do not auto-resume even if a session exists')
   .option('--refresh-understanding', 'Recompute agent understanding even when resuming')
+  .option('--concurrency <count>', 'Number of files to port in parallel', '4')
+  .option('--no-auto-concurrency', 'Disable adaptive concurrency')
   .action(portProject);
 
 program
