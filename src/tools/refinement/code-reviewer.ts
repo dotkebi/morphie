@@ -3,7 +3,7 @@
  */
 
 import { BaseTool, type ToolContext, type ToolResult } from '../tool-base.js';
-import { OllamaClient } from '../../llm/ollama.js';
+import type { LLMClient } from '../../llm/types.js';
 import type { QualityIssue, Suggestion } from '../../types/agent-types.js';
 
 export interface ReviewResult {
@@ -18,9 +18,9 @@ export class CodeReviewer extends BaseTool {
     readonly description = 'Reviews ported code for quality, idioms, and potential issues';
     readonly category = 'refinement' as const;
 
-    private llm: OllamaClient;
+    private llm: LLMClient;
 
-    constructor(llm: OllamaClient) {
+    constructor(llm: LLMClient) {
         super();
         this.llm = llm;
     }

@@ -1,4 +1,4 @@
-import { OllamaClient } from '../llm/ollama.js';
+import type { LLMClient } from '../llm/types.js';
 import { SourceFile, ExportedSymbol } from './analyzer.js';
 import { getTargetExtension, getLanguageFeatures } from '../utils/languages.js';
 import path from 'path';
@@ -42,7 +42,8 @@ export interface PortingPromptOptions {
 }
 
 export class PortingEngine {
-  private llm: OllamaClient;
+  private static hasDumpedPrompt = false;
+  private llm: LLMClient;
   private sourceLanguage: string;
   private targetLanguage: string;
   private verbose: boolean;
@@ -51,7 +52,7 @@ export class PortingEngine {
   private promptMode: 'full' | 'reduced' | 'minimal';
 
   constructor(
-    llm: OllamaClient,
+    llm: LLMClient,
     sourceLanguage: string,
     targetLanguage: string,
     verbose = false,
@@ -158,6 +159,31 @@ export class PortingEngine {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       let prompt = this.buildPortingPrompt(workingFile, options);
+      if (this.verbose) {
+        const sourceLength = workingFile.content.length;
+        const importContextLength = options.suppressImports ? 0 : this.buildImportContext(workingFile).length;
+        const promptWithoutSource = Math.max(0, prompt.length - sourceLength);
+        const chunkLabel = options.chunked
+          ? ` chunk=${(options.chunkIndex ?? 0) + 1}/${options.totalChunks ?? 1}`
+          : '';
+        console.log(
+          `[Porting Debug] Prompt stats (${workingFile.relativePath}) ` +
+          `attempt=${attempt}${chunkLabel} mode=${this.promptMode} total=${prompt.length} ` +
+          `source=${sourceLength} importContext=${importContextLength} promptWithoutSource=${promptWithoutSource}`
+        );
+      }
+      if (process.env.MORPHIE_DEBUG_PROMPT === '1' && !PortingEngine.hasDumpedPrompt) {
+        const chunkLabel = options.chunked
+          ? ` chunk=${(options.chunkIndex ?? 0) + 1}/${options.totalChunks ?? 1}`
+          : '';
+        console.log(
+          `[Porting Debug] Prompt dump (${workingFile.relativePath}) attempt=${attempt}${chunkLabel} mode=${this.promptMode}`
+        );
+        console.log('----- MORPHIE PROMPT START -----');
+        console.log(prompt);
+        console.log('----- MORPHIE PROMPT END -----');
+        PortingEngine.hasDumpedPrompt = true;
+      }
 
       if (this.targetLanguage === 'dart' && attempt > 1 && !options.suppressImports) {
         requiredImports = this.getRequiredDartImports(file, targetPath);
@@ -173,6 +199,12 @@ export class PortingEngine {
 
       if (!response || response.trim() === '') {
         lastError = 'Empty response from LLM';
+        if (this.verbose) {
+          const chunkLabel = options.chunked
+            ? ` chunk=${(options.chunkIndex ?? 0) + 1}/${options.totalChunks ?? 1}`
+            : '';
+          console.log(`[Porting Debug] Retry reason:${chunkLabel} attempt=${attempt} -> ${lastError}`);
+        }
         await this.sleep(this.getBackoffMs(attempt));
         continue;
       }
@@ -181,6 +213,12 @@ export class PortingEngine {
 
       if (!portedContent || portedContent.trim() === '') {
         lastError = 'Failed to extract code from LLM response';
+        if (this.verbose) {
+          const chunkLabel = options.chunked
+            ? ` chunk=${(options.chunkIndex ?? 0) + 1}/${options.totalChunks ?? 1}`
+            : '';
+          console.log(`[Porting Debug] Retry reason:${chunkLabel} attempt=${attempt} -> ${lastError}`);
+        }
         await this.sleep(this.getBackoffMs(attempt));
         continue;
       }
@@ -204,6 +242,14 @@ export class PortingEngine {
 
           if (importIssues.length === 0) {
             break;
+          }
+          if (this.verbose) {
+            const chunkLabel = options.chunked
+              ? ` chunk=${(options.chunkIndex ?? 0) + 1}/${options.totalChunks ?? 1}`
+              : '';
+            console.log(
+              `[Porting Debug] Retry reason:${chunkLabel} attempt=${attempt} -> Import issues (${importIssues.length})`
+            );
           }
         } else {
           break;
@@ -670,6 +716,7 @@ export class PortingEngine {
     const sourceFeatures = getLanguageFeatures(this.sourceLanguage);
     const targetFeatures = getLanguageFeatures(this.targetLanguage);
     const importContext = options.suppressImports ? '' : this.buildImportContext(file);
+    const sourceContent = options.overrideContent ?? file.content;
     const chunkNotice = options.chunked
       ? `## Chunked Porting (CRITICAL)
 You are porting chunk ${options.chunkIndex! + 1} of ${options.totalChunks!} from a larger file.
@@ -1049,7 +1096,7 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
 
   private buildMinimalPrompt(file: SourceFile, options: PortingPromptOptions = {}): string {
     const importContext = options.suppressImports ? '' : this.buildImportContext(file);
-    const sourceContent = file.content;
+    const sourceContent = options.overrideContent ?? file.content;
     const chunkNotice = options.chunked
       ? `\nChunk ${options.chunkIndex! + 1} of ${options.totalChunks!}. ${options.suppressImports ? 'Do NOT include imports.' : 'Include imports only if appropriate at top of file.'}\n`
       : '';

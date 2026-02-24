@@ -3,7 +3,7 @@
  */
 
 import { ToolRegistry, type Tool } from './tool-base.js';
-import { OllamaClient } from '../llm/ollama.js';
+import type { LLMClient } from '../llm/types.js';
 import { DeepAnalyzer } from './analysis/deep-analyzer.js';
 import { FilePorter } from './porting/file-porter.js';
 import { SyntaxChecker } from './verification/syntax-checker.js';
@@ -12,9 +12,9 @@ import type { ToolContext, ToolResult } from '../types/agent-types.js';
 
 export class ToolManager {
     private registry: ToolRegistry;
-    private llm: OllamaClient;
+    private llm: LLMClient;
 
-    constructor(llm: OllamaClient) {
+    constructor(llm: LLMClient) {
         this.llm = llm;
         this.registry = new ToolRegistry();
         this.registerDefaultTools();
@@ -28,7 +28,7 @@ export class ToolManager {
         this.registry.register(new DeepAnalyzer());
 
         // Porting tools
-        this.registry.register(new FilePorter(this.llm));
+        this.registry.register(new FilePorter(this.llm, { maxRetries: 6 }));
 
         // Verification tools
         this.registry.register(new SyntaxChecker());

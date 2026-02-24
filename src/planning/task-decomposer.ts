@@ -2,7 +2,7 @@
  * Task Decomposer - Breaks down porting tasks into subtasks
  */
 
-import { OllamaClient } from '../llm/ollama.js';
+import type { LLMClient } from '../llm/types.js';
 import type {
     PortingTask,
     TaskUnderstanding,
@@ -20,9 +20,9 @@ export interface DecompositionResult {
 }
 
 export class TaskDecomposer {
-    private llm: OllamaClient;
+    private llm: LLMClient;
 
-    constructor(llm: OllamaClient) {
+    constructor(llm: LLMClient) {
         this.llm = llm;
     }
 

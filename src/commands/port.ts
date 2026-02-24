@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { ProjectAnalyzer } from '../core/analyzer.js';
 import { PortingEngine } from '../core/porting-engine.js';
 import { AgentOrchestrator } from '../core/agent-orchestrator.js';
-import { OllamaClient } from '../llm/ollama.js';
+import { createLLMClient, type LLMProvider } from '../llm/factory.js';
 import { FileSystem } from '../utils/filesystem.js';
 import { addDartDependencies, generateProjectFiles } from '../utils/project-config.js';
 import { SessionManager } from '../utils/session.js';
@@ -26,6 +26,9 @@ interface PortOptions {
   from: string;
   to: string;
   model: string;
+  provider?: string;
+  baseUrl?: string;
+  apiKey?: string;
   ollamaUrl: string;
   dryRun?: boolean;
   verbose?: boolean;
@@ -72,6 +75,14 @@ function parseTestMode(value: string | undefined): TestMode {
     return mode;
   }
   throw new Error(`Invalid --test-mode: ${value}. Use one of: mixed, defer, only, skip.`);
+}
+
+function parseProvider(value: string | undefined): LLMProvider {
+  const provider = (value ?? 'ollama').toLowerCase();
+  if (provider === 'ollama' || provider === 'openai') {
+    return provider;
+  }
+  throw new Error(`Invalid --provider: ${value}. Use one of: ollama, openai.`);
 }
 
 function selectFilesByTestMode<T extends { type: string }>(files: T[], mode: TestMode): T[] {
@@ -224,6 +235,8 @@ export async function portProject(
   const spinner = ora('Initializing...').start();
 
   try {
+    const provider = parseProvider(options.provider);
+    const baseUrl = options.baseUrl ?? options.ollamaUrl;
     const testMode = parseTestMode(options.testMode);
     const sessionManager = new SessionManager();
     const sessionPath = `${target}/.morphie/session.json`;
@@ -256,11 +269,16 @@ export async function portProject(
     }
 
     // Initialize LLM client
-    spinner.text = 'Connecting to Ollama...';
-    const llm = new OllamaClient(options.ollamaUrl, options.model);
+    spinner.text = `Connecting to ${provider} endpoint...`;
+    const llm = createLLMClient({
+      provider,
+      baseUrl,
+      model: options.model,
+      apiKey: options.apiKey,
+    });
     const isConnected = await llm.healthCheck();
     if (!isConnected) {
-      spinner.fail('Cannot connect to Ollama. Make sure Ollama is running.');
+      spinner.fail(`Cannot connect to ${provider} endpoint: ${baseUrl}`);
       process.exit(1);
     }
 
@@ -313,7 +331,7 @@ export async function portProject(
         resume: shouldResume,
         sessionPath,
         refreshUnderstanding: options.refreshUnderstanding,
-        concurrency: parsePositiveInt(options.concurrency, 4),
+        concurrency: parsePositiveInt(options.concurrency, 2),
         autoConcurrency: options.autoConcurrency,
         testMode,
       });
@@ -406,15 +424,27 @@ export async function portProject(
     const importIssues: Array<{ file: string; issues: string[]; required: string[]; actual: string[] }> = [];
     const completed = new Set(existingSession?.completedFiles ?? []);
     const fileHashes = existingSession?.fileHashes ?? {};
-    const baseConcurrency = parsePositiveInt(options.concurrency, 4);
+    const baseConcurrency = parsePositiveInt(options.concurrency, 2);
     const autoConcurrency = options.autoConcurrency !== false;
     const semaphore = new AdaptiveSemaphore(baseConcurrency);
     let processed = 0;
     const files = selectedFiles;
+    let skippedCount = 0;
+
+    const resumableCount = files.reduce((count, file) => {
+      const contentHash = crypto.createHash('sha256').update(file.content).digest('hex');
+      return completed.has(file.relativePath) && fileHashes[file.relativePath] === contentHash
+        ? count + 1
+        : count;
+    }, 0);
+    if (resumableCount > 0) {
+      console.log(chalk.gray(`Resuming session: ${resumableCount} files will be skipped (already completed).`));
+    }
 
     const tasks = files.map(async file => {
       const contentHash = crypto.createHash('sha256').update(file.content).digest('hex');
       if (completed.has(file.relativePath) && fileHashes[file.relativePath] === contentHash) {
+        skippedCount++;
         return;
       }
 
@@ -424,6 +454,7 @@ export async function portProject(
       const fileSpinner = ora(`${progress} ${percent}% Porting ${file.relativePath}...`).start();
 
       try {
+        session.failedFiles = session.failedFiles.filter(item => item.file !== file.relativePath);
         const result = await engine.portFile(file);
         await fs.writeFile(
           `${target}/${result.targetPath}`,
@@ -452,6 +483,7 @@ export async function portProject(
           console.log(chalk.red(`  Error: ${error.message}`));
         }
         failCount++;
+        session.failedFiles = session.failedFiles.filter(item => item.file !== file.relativePath);
         session.failedFiles.push({
           file: file.relativePath,
           error: message,
@@ -472,6 +504,9 @@ export async function portProject(
     });
 
     await Promise.all(tasks);
+    if (skippedCount > 0) {
+      console.log(chalk.gray(`Skipped ${skippedCount} unchanged files from previous session.`));
+    }
 
     const totalTime = Math.round((Date.now() - startTime) / 1000);
 

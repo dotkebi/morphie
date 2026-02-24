@@ -1,19 +1,10 @@
 import http from 'http';
 import https from 'https';
+import type { GenerateOptions, LLMClient, LLMModel } from './types.js';
+export type { GenerateOptions, LLMClient, LLMModel };
+export type OllamaModel = LLMModel;
 
-export interface OllamaModel {
-  name: string;
-  size?: number;
-  modifiedAt?: string;
-}
-
-export interface GenerateOptions {
-  temperature?: number;
-  topP?: number;
-  maxTokens?: number;
-}
-
-export class OllamaClient {
+export class OllamaClient implements LLMClient {
   private baseUrl: string;
   private model: string;
   private defaultOptions: GenerateOptions;

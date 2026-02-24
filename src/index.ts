@@ -7,7 +7,10 @@ export { PortingEngine } from './core/porting-engine.js';
 export type { PortedFile } from './core/porting-engine.js';
 
 export { OllamaClient } from './llm/ollama.js';
-export type { OllamaModel, GenerateOptions } from './llm/ollama.js';
+export { OpenAICompatibleClient } from './llm/openai-compatible.js';
+export { createLLMClient } from './llm/factory.js';
+export type { LLMProvider } from './llm/factory.js';
+export type { OllamaModel, GenerateOptions, LLMClient, LLMModel } from './llm/ollama.js';
 
 export { FileSystem } from './utils/filesystem.js';
 export {

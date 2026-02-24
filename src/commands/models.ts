@@ -1,22 +1,40 @@
 import chalk from 'chalk';
 import ora from 'ora';
-import { OllamaClient } from '../llm/ollama.js';
+import { createLLMClient, type LLMProvider } from '../llm/factory.js';
 
 interface ModelsOptions {
+  provider?: string;
+  baseUrl?: string;
+  apiKey?: string;
   ollamaUrl: string;
+}
+
+function parseProvider(value: string | undefined): LLMProvider {
+  const provider = (value ?? 'ollama').toLowerCase();
+  if (provider === 'ollama' || provider === 'openai') {
+    return provider;
+  }
+  throw new Error(`Invalid --provider: ${value}. Use one of: ollama, openai.`);
 }
 
 export async function listModels(options: ModelsOptions): Promise<void> {
   console.log(chalk.blue.bold('\n🍴 Morphie - Available Models\n'));
 
-  const spinner = ora('Fetching models from Ollama...').start();
+  const provider = parseProvider(options.provider);
+  const baseUrl = options.baseUrl ?? options.ollamaUrl;
+  const spinner = ora(`Fetching models from ${provider}...`).start();
 
   try {
-    const client = new OllamaClient(options.ollamaUrl);
+    const client = createLLMClient({
+      provider,
+      baseUrl,
+      model: 'placeholder',
+      apiKey: options.apiKey,
+    });
     const models = await client.listModels();
 
     if (models.length === 0) {
-      spinner.warn('No models found. Pull a model with: ollama pull codellama');
+      spinner.warn('No models found at the configured endpoint.');
       return;
     }
 
@@ -42,7 +60,7 @@ export async function listModels(options: ModelsOptions): Promise<void> {
     if (error instanceof Error) {
       console.error(chalk.red(`Error: ${error.message}`));
     }
-    console.log(chalk.yellow('\nMake sure Ollama is running: ollama serve'));
+    console.log(chalk.yellow(`\nVerify provider/base URL: ${provider} @ ${baseUrl}`));
     process.exit(1);
   }
 }

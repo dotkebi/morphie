@@ -19,7 +19,10 @@ program
   .argument('<target>', 'Target output directory')
   .requiredOption('-f, --from <language>', 'Source language (e.g., python, javascript, go)')
   .requiredOption('-t, --to <language>', 'Target language (e.g., rust, typescript, java)')
-  .option('-m, --model <model>', 'LLM model to use (default: glm-4.7-flash:q8_0)', 'glm-4.7-flash:q8_0')
+  .option('-m, --model <model>', 'LLM model to use (default: qwen3-coder:30b)', 'qwen3-coder:30b')
+  .option('--provider <provider>', 'LLM provider: ollama|openai', 'ollama')
+  .option('--base-url <url>', 'LLM API base URL (overrides --ollama-url if set)')
+  .option('--api-key <key>', 'API key for OpenAI-compatible providers')
   .option('--ollama-url <url>', 'Ollama API URL', 'http://localhost:11434')
   .option('--dry-run', 'Analyze without actually porting')
   .option('-v, --verbose', 'Verbose output')
@@ -38,7 +41,7 @@ program
   .option('--resume', 'Resume from last session in <target>/.morphie/session.json')
   .option('--no-resume', 'Do not auto-resume even if a session exists')
   .option('--refresh-understanding', 'Recompute agent understanding even when resuming')
-  .option('--concurrency <count>', 'Number of files to port in parallel', '4')
+  .option('--concurrency <count>', 'Number of files to port in parallel', '2')
   .option('--no-auto-concurrency', 'Disable adaptive concurrency')
   .option('--test-mode <mode>', 'How to port test files: mixed|defer|only|skip', 'mixed')
   .action(portProject);
@@ -53,7 +56,10 @@ program
 
 program
   .command('models')
-  .description('List available LLM models from Ollama')
+  .description('List available LLM models from provider endpoint')
+  .option('--provider <provider>', 'LLM provider: ollama|openai', 'ollama')
+  .option('--base-url <url>', 'LLM API base URL (overrides --ollama-url if set)')
+  .option('--api-key <key>', 'API key for OpenAI-compatible providers')
   .option('--ollama-url <url>', 'Ollama API URL', 'http://localhost:11434')
   .action(listModels);
 

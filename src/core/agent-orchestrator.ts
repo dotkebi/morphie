@@ -3,7 +3,7 @@
  * Implements the Think → Plan → Act → Observe → Reflect loop
  */
 
-import { OllamaClient } from '../llm/ollama.js';
+import type { LLMClient } from '../llm/types.js';
 import { ConversationManager } from '../conversation/conversation-manager.js';
 import { ToolRegistry } from '../tools/tool-base.js';
 import { DeepAnalyzer } from '../tools/analysis/deep-analyzer.js';
@@ -80,7 +80,7 @@ class AdaptiveSemaphore {
 type TestMode = 'mixed' | 'defer' | 'only' | 'skip';
 
 export class AgentOrchestrator {
-    private llm: OllamaClient;
+    private llm: LLMClient;
     private conversation: ConversationManager;
     private toolRegistry: ToolRegistry;
     private verbose: boolean;
@@ -104,7 +104,7 @@ export class AgentOrchestrator {
     private lastEmptyResponseFiles?: string[];
 
     constructor(
-        llm: OllamaClient,
+        llm: LLMClient,
         options: {
             verbose?: boolean;
             interactive?: boolean;
@@ -127,7 +127,7 @@ export class AgentOrchestrator {
      */
     private registerTools(): void {
         this.toolRegistry.register(new DeepAnalyzer());
-        this.toolRegistry.register(new FilePorter(this.llm));
+        this.toolRegistry.register(new FilePorter(this.llm, { maxRetries: 6 }));
         this.toolRegistry.register(new SyntaxChecker());
         this.toolRegistry.register(new DartAnalyzer());
     }
@@ -590,14 +590,26 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
             ? baseFiles.filter(file => onlyFiles.has(file.relativePath))
             : baseFiles;
         const totalToPort = filesToPort.length;
-        const baseConcurrency = Math.max(1, task.concurrency ?? 4);
+        const baseConcurrency = Math.max(1, task.concurrency ?? 2);
         const autoConcurrency = task.autoConcurrency !== false;
         const semaphore = new AdaptiveSemaphore(baseConcurrency);
         let processed = 0;
+        let skippedCount = 0;
+
+        const resumableCount = filesToPort.reduce((count, file) => {
+            const contentHash = crypto.createHash('sha256').update(file.content).digest('hex');
+            return completed.has(file.relativePath) && fileHashes[file.relativePath] === contentHash
+                ? count + 1
+                : count;
+        }, 0);
+        if (resumableCount > 0) {
+            this.log(`  Resuming session: ${resumableCount} files will be skipped (already completed).`);
+        }
 
         const tasks = filesToPort.map(async file => {
             const contentHash = crypto.createHash('sha256').update(file.content).digest('hex');
             if (completed.has(file.relativePath) && fileHashes[file.relativePath] === contentHash) {
+                skippedCount += 1;
                 return;
             }
 
@@ -606,6 +618,10 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
             this.log(`  ${progress} Porting ${file.relativePath}...`);
 
             try {
+                if (this.session && this.sessionPath) {
+                    this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== file.relativePath);
+                    await this.sessionManager.save(this.sessionPath, this.session);
+                }
                 const result = await filePorter.execute({
                     file,
                     sourceLanguage: task.sourceLanguage,
@@ -649,6 +665,7 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
                         fileHashes[file.relativePath] = contentHash;
                         this.session.completedFiles = Array.from(completed);
                         this.session.fileHashes = fileHashes;
+                        this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== file.relativePath);
                         this.session.phase = 'porting';
                         await this.sessionManager.save(this.sessionPath, this.session);
                     }
@@ -661,6 +678,7 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
                     });
                     this.log(`  ${progress} ✗ Failed: ${file.relativePath}`);
                     if (this.session && this.sessionPath) {
+                        this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== file.relativePath);
                         this.session.failedFiles.push({
                             file: file.relativePath,
                             error: result.error || 'Unknown error',
@@ -689,6 +707,7 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
                 });
                 this.log(`  ${progress} ✗ Error: ${file.relativePath}`);
                 if (this.session && this.sessionPath) {
+                    this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== file.relativePath);
                     this.session.failedFiles.push({
                         file: file.relativePath,
                         error: errorMessage,
@@ -713,6 +732,9 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         });
 
         await Promise.all(tasks);
+        if (skippedCount > 0) {
+            this.log(`  Skipped ${skippedCount} unchanged files from previous session.`);
+        }
 
         this.lastPortedFiles = portedFiles;
         if (portedFiles.some(file => file.metadata?.importIssues?.length)) {

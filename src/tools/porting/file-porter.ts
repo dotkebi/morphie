@@ -3,7 +3,7 @@
  */
 
 import { BaseTool, type ToolContext, type ToolResult } from '../tool-base.js';
-import { OllamaClient } from '../../llm/ollama.js';
+import type { LLMClient } from '../../llm/types.js';
 import { PortingEngine } from '../../core/porting-engine.js';
 import type { PortedFile } from '../../types/agent-types.js';
 
@@ -18,16 +18,18 @@ export class FilePorter extends BaseTool {
     readonly description = 'Ports individual files with full context awareness and self-verification';
     readonly category = 'porting' as const;
 
-    private llm: OllamaClient;
+    private llm: LLMClient;
     private options: Required<FilePorterOptions>;
-    private maxPromptTokens = 12000;
+    private maxPromptTokens = 2200;
+    private reducedPromptTokens = 1400;
+    private minimalPromptTokens = 1800;
 
-    constructor(llm: OllamaClient, options: FilePorterOptions = {}) {
+    constructor(llm: LLMClient, options: FilePorterOptions = {}) {
         super();
         this.llm = llm;
         this.options = {
             verifyAfterPort: options.verifyAfterPort ?? true,
-            maxRetries: options.maxRetries ?? 4,
+            maxRetries: options.maxRetries ?? 6,
             includeComments: options.includeComments ?? true,
         };
     }
@@ -65,12 +67,6 @@ export class FilePorter extends BaseTool {
                         engine.buildImportMapping(allFiles);
                     }
 
-                    if (attempts === 2) {
-                        engine.setPromptMode('reduced');
-                    } else if (attempts >= 3) {
-                        engine.setPromptMode('minimal');
-                    }
-
                     const promptTokens = engine.estimatePromptTokens(file);
                     if (promptTokens > this.maxPromptTokens && !attemptedChunking) {
                         attemptedChunking = true;
@@ -85,6 +81,16 @@ export class FilePorter extends BaseTool {
                             file: chunked,
                             chunked: true,
                         });
+                    }
+
+                    if (attempts >= 3) {
+                        engine.setPromptMode('minimal');
+                    } else if (attempts === 2) {
+                        engine.setPromptMode('reduced');
+                    } else if (promptTokens > this.minimalPromptTokens) {
+                        engine.setPromptMode('minimal');
+                    } else if (promptTokens > this.reducedPromptTokens) {
+                        engine.setPromptMode('reduced');
                     }
 
                     // Port the file
@@ -223,20 +229,27 @@ export class FilePorter extends BaseTool {
 
         const estimatedTokens = engine.estimatePromptTokens(file);
         const chunkCount = Math.max(2, Math.ceil(estimatedTokens / this.maxPromptTokens));
-        const chunks = this.splitContentIntoChunks(file.content, chunkCount);
+        const initialChunks = await this.splitContentIntoChunks(
+            file.content,
+            chunkCount,
+            sourceLanguage,
+            file.relativePath
+        );
+        const chunks = this.enforceChunkTokenLimit(engine, file, initialChunks);
         const outputs: string[] = [];
 
         for (let index = 0; index < chunks.length; index += 1) {
             const chunkContent = chunks[index];
+            const suppressImports = targetLanguage === 'dart' ? true : index > 0;
             const ported = await engine.portFileWithOptions(file, {
                 overrideContent: chunkContent,
                 chunked: true,
                 chunkIndex: index,
                 totalChunks: chunks.length,
-                suppressImports: index > 0,
+                suppressImports,
             });
             let content = ported.content;
-            if (index > 0) {
+            if (targetLanguage === 'dart' || index > 0) {
                 content = this.stripImports(content);
             }
             outputs.push(content.trim());
@@ -265,7 +278,27 @@ export class FilePorter extends BaseTool {
             .trim();
     }
 
-    private splitContentIntoChunks(content: string, chunkCount: number): string[] {
+    private async splitContentIntoChunks(
+        content: string,
+        chunkCount: number,
+        sourceLanguage: string,
+        filePath: string
+    ): Promise<string[]> {
+        if (this.canUseTypeScriptAst(sourceLanguage, filePath)) {
+            try {
+                const chunks = await this.splitWithTypeScriptAst(content, chunkCount, filePath);
+                if (chunks.length > 1) {
+                    return chunks;
+                }
+            } catch {
+                // Fallback to line-based chunking when AST parsing fails
+            }
+        }
+
+        return this.splitByLineBoundaries(content, chunkCount);
+    }
+
+    private splitByLineBoundaries(content: string, chunkCount: number): string[] {
         const lines = content.split('\n');
         if (chunkCount <= 1 || lines.length <= 1) {
             return [content];
@@ -284,6 +317,138 @@ export class FilePorter extends BaseTool {
             chunks.push(lines.slice(start).join('\n'));
         }
         return chunks.filter(chunk => chunk.trim().length > 0);
+    }
+
+    private canUseTypeScriptAst(sourceLanguage: string, filePath: string): boolean {
+        const language = sourceLanguage.toLowerCase();
+        if (language === 'typescript' || language === 'javascript') {
+            return true;
+        }
+        return /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(filePath);
+    }
+
+    private enforceChunkTokenLimit(engine: PortingEngine, file: any, chunks: string[]): string[] {
+        const queue = [...chunks];
+        const limited: string[] = [];
+        const maxLinesToSplit = 24;
+
+        while (queue.length > 0) {
+            const candidate = queue.shift();
+            if (!candidate || !candidate.trim()) {
+                continue;
+            }
+
+            const estimatedTokens = engine.estimatePromptTokens(file, {
+                overrideContent: candidate,
+                chunked: true,
+                chunkIndex: 0,
+                totalChunks: 1,
+                suppressImports: false,
+            });
+
+            if (estimatedTokens <= this.maxPromptTokens) {
+                limited.push(candidate);
+                continue;
+            }
+
+            const lines = candidate.split('\n');
+            if (lines.length <= maxLinesToSplit) {
+                limited.push(candidate);
+                continue;
+            }
+
+            const mid = Math.floor(lines.length / 2);
+            const left = lines.slice(0, mid).join('\n').trim();
+            const right = lines.slice(mid).join('\n').trim();
+            if (right) queue.unshift(right);
+            if (left) queue.unshift(left);
+        }
+
+        return limited.length > 0 ? limited : chunks;
+    }
+
+    private async splitWithTypeScriptAst(content: string, chunkCount: number, filePath: string): Promise<string[]> {
+        const ts = await import('typescript');
+        const scriptKind = this.getScriptKind(ts, filePath);
+        const sourceFile = ts.createSourceFile(
+            filePath || 'source.ts',
+            content,
+            ts.ScriptTarget.Latest,
+            true,
+            scriptKind
+        );
+
+        const targetSize = Math.max(2000, Math.ceil(content.length / chunkCount));
+        const units: string[] = [];
+
+        for (const statement of sourceFile.statements) {
+            if (ts.isClassDeclaration(statement) && statement.members.length > 6) {
+                units.push(...this.splitClassByMembers(content, statement, targetSize));
+            } else {
+                const unitText = content
+                    .slice(statement.getFullStart(), statement.getEnd())
+                    .trim();
+                if (unitText.length > 0) {
+                    units.push(unitText);
+                }
+            }
+        }
+
+        if (units.length === 0) {
+            return this.splitByLineBoundaries(content, chunkCount);
+        }
+
+        const chunks: string[] = [];
+        let current = '';
+        for (const unit of units) {
+            if (current.length > 0 && (current.length + unit.length + 2) > targetSize) {
+                chunks.push(current.trim());
+                current = unit;
+            } else {
+                current = current.length > 0 ? `${current}\n\n${unit}` : unit;
+            }
+        }
+        if (current.trim().length > 0) {
+            chunks.push(current.trim());
+        }
+
+        return chunks.length > 0 ? chunks : this.splitByLineBoundaries(content, chunkCount);
+    }
+
+    private splitClassByMembers(
+        content: string,
+        classNode: any,
+        targetSize: number
+    ): string[] {
+        const members = [...classNode.members];
+        if (members.length === 0) {
+            const wholeClass = content.slice(classNode.getFullStart(), classNode.getEnd()).trim();
+            return wholeClass ? [wholeClass] : [];
+        }
+
+        const header = content.slice(classNode.getStart(), classNode.members.pos).trimEnd();
+        const footer = content.slice(classNode.members.end, classNode.getEnd()).trimStart();
+        const memberTexts = members
+            .map(member => content.slice(member.getFullStart(), member.getEnd()).trim())
+            .filter(Boolean);
+
+        // Method/member-level chunking: one class member per chunk.
+        // This is intentional to avoid oversized prompts for large classes.
+        return memberTexts.map(memberText => this.buildClassChunk(header, footer, [memberText]));
+    }
+
+    private buildClassChunk(header: string, footer: string, members: string[]): string {
+        const body = members.join('\n\n');
+        return `${header}\n${body}\n${footer}`.trim();
+    }
+
+    private getScriptKind(ts: any, filePath: string): any {
+        if (filePath.endsWith('.tsx')) return ts.ScriptKind.TSX;
+        if (filePath.endsWith('.jsx')) return ts.ScriptKind.JSX;
+        if (filePath.endsWith('.js') || filePath.endsWith('.mjs') || filePath.endsWith('.cjs')) {
+            return ts.ScriptKind.JS;
+        }
+        return ts.ScriptKind.TS;
     }
 
     private findChunkBoundaries(lines: string[], targetLinesPerChunk: number): number[] {
