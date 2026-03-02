@@ -60,6 +60,8 @@ export class OpenAICompatibleClient implements LLMClient {
 
   async generate(prompt: string, options?: GenerateOptions): Promise<string> {
     const opts = { ...this.defaultOptions, ...options };
+    const startedAt = Date.now();
+    const verbose = options?.verbose === true;
     const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: this.headers(),
@@ -75,11 +77,19 @@ export class OpenAICompatibleClient implements LLMClient {
 
     if (!response.ok) {
       const error = await response.text();
+      if (verbose) {
+        const elapsedMs = Date.now() - startedAt;
+        console.log(`[OpenAI Debug] Response time (failed): ${elapsedMs}ms`);
+      }
       throw new Error(`OpenAI-compatible generation failed: ${error}`);
     }
 
     const data = await response.json() as OpenAIChatCompletionResponse;
     const content = data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? '';
+    if (verbose) {
+      const elapsedMs = Date.now() - startedAt;
+      console.log(`[OpenAI Debug] Response time: ${elapsedMs}ms`);
+    }
     return content;
   }
 

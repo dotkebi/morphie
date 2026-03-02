@@ -28,7 +28,7 @@ export class ToolManager {
         this.registry.register(new DeepAnalyzer());
 
         // Porting tools
-        this.registry.register(new FilePorter(this.llm, { maxRetries: 6 }));
+        this.registry.register(new FilePorter(this.llm, { maxRetries: 2 }));
 
         // Verification tools
         this.registry.register(new SyntaxChecker());

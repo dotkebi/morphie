@@ -30,7 +30,7 @@ export interface PortingTask {
   refreshUnderstanding?: boolean;
   concurrency?: number;
   autoConcurrency?: boolean;
-  testMode?: 'mixed' | 'defer' | 'only' | 'skip';
+  testMode?: 'skip' | 'only';
 }
 
 export interface TaskUnderstanding {

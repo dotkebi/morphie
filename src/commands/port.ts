@@ -4,12 +4,13 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import crypto from 'crypto';
-import { ProjectAnalyzer } from '../core/analyzer.js';
+import { ProjectAnalyzer, type SourceFile } from '../core/analyzer.js';
 import { PortingEngine } from '../core/porting-engine.js';
 import { AgentOrchestrator } from '../core/agent-orchestrator.js';
 import { createLLMClient, type LLMProvider } from '../llm/factory.js';
 import { FileSystem } from '../utils/filesystem.js';
 import { addDartDependencies, generateProjectFiles } from '../utils/project-config.js';
+import { orderFilesForPorting } from '../utils/porting-order.js';
 import { SessionManager } from '../utils/session.js';
 
 function formatTime(seconds: number): string {
@@ -29,6 +30,10 @@ interface PortOptions {
   provider?: string;
   baseUrl?: string;
   apiKey?: string;
+  reviewerModel?: string;
+  reviewerProvider?: string;
+  reviewerBaseUrl?: string;
+  reviewerApiKey?: string;
   ollamaUrl: string;
   dryRun?: boolean;
   verbose?: boolean;
@@ -51,7 +56,7 @@ interface PortOptions {
   testMode?: string;
 }
 
-type TestMode = 'mixed' | 'defer' | 'only' | 'skip';
+type TestMode = 'skip' | 'only';
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
@@ -70,11 +75,11 @@ function parseNonNegativeInt(value: string | undefined, fallback: number): numbe
 }
 
 function parseTestMode(value: string | undefined): TestMode {
-  const mode = (value ?? 'mixed').toLowerCase();
-  if (mode === 'mixed' || mode === 'defer' || mode === 'only' || mode === 'skip') {
+  const mode = (value ?? 'skip').toLowerCase();
+  if (mode === 'skip' || mode === 'only') {
     return mode;
   }
-  throw new Error(`Invalid --test-mode: ${value}. Use one of: mixed, defer, only, skip.`);
+  throw new Error(`Invalid --test-mode: ${value}. Use one of: skip, only.`);
 }
 
 function parseProvider(value: string | undefined): LLMProvider {
@@ -90,16 +95,46 @@ function selectFilesByTestMode<T extends { type: string }>(files: T[], mode: Tes
   const nonTestFiles = files.filter(file => file.type !== 'test');
 
   switch (mode) {
-    case 'defer':
-      return [...nonTestFiles, ...testFiles];
     case 'only':
       return testFiles;
     case 'skip':
-      return nonTestFiles;
-    case 'mixed':
     default:
-      return files;
+      return nonTestFiles;
   }
+}
+
+function buildApiSnapshot(files: SourceFile[], targetLanguage: string): string {
+  if (targetLanguage !== 'dart') {
+    return '';
+  }
+
+  const coreTargets = new Set([
+    'src/element.ts',
+    'src/tickable.ts',
+    'src/fraction.ts',
+    'src/tables.ts',
+    'src/typeguard.ts',
+    'src/util.ts',
+    'src/boundingbox.ts',
+    'src/rendercontext.ts',
+    'src/stave.ts',
+  ]);
+
+  const sections: string[] = [];
+  for (const file of files) {
+    if (!coreTargets.has(file.relativePath)) continue;
+    const symbols = file.exports.map(symbol => `${symbol.type} ${symbol.name}`).slice(0, 20);
+    const methodMatches = Array.from(file.content.matchAll(/\b(?:public|private|protected|static\s+)?([A-Za-z_]\w*)\s*\([^)]*\)\s*\{/g))
+      .map(match => match[1])
+      .filter(name => !['if', 'for', 'while', 'switch', 'catch'].includes(name))
+      .slice(0, 30);
+    const uniqMethods = Array.from(new Set(methodMatches));
+    const lines: string[] = [];
+    if (symbols.length > 0) lines.push(`exports: ${symbols.join(', ')}`);
+    if (uniqMethods.length > 0) lines.push(`methods: ${uniqMethods.join(', ')}`);
+    if (lines.length > 0) sections.push(`- ${file.relativePath}: ${lines.join(' | ')}`);
+  }
+  return sections.slice(0, 20).join('\n');
 }
 
 const execFileAsync = promisify(execFile);
@@ -237,6 +272,16 @@ export async function portProject(
   try {
     const provider = parseProvider(options.provider);
     const baseUrl = options.baseUrl ?? options.ollamaUrl;
+    const reviewerProvider = parseProvider(options.reviewerProvider ?? options.provider);
+    const reviewerBaseUrl = options.reviewerBaseUrl ?? options.baseUrl ?? options.ollamaUrl;
+    const reviewerModel = options.reviewerModel?.trim() || 'deepseek-r1:70b';
+    const reviewerApiKey = options.reviewerApiKey ?? options.apiKey;
+    process.env.MORPHIE_REVIEWER_MODEL = reviewerModel;
+    process.env.MORPHIE_REVIEWER_PROVIDER = reviewerProvider;
+    process.env.MORPHIE_REVIEWER_BASE_URL = reviewerBaseUrl;
+    if (reviewerApiKey) {
+      process.env.MORPHIE_REVIEWER_API_KEY = reviewerApiKey;
+    }
     const testMode = parseTestMode(options.testMode);
     const sessionManager = new SessionManager();
     const sessionPath = `${target}/.morphie/session.json`;
@@ -380,6 +425,9 @@ export async function portProject(
     await sessionManager.save(sessionPath, session);
 
     if (options.verbose) {
+      console.log(chalk.gray(`  Reviewer model: ${reviewerModel}`));
+      console.log(chalk.gray(`  Reviewer provider: ${reviewerProvider}`));
+      console.log(chalk.gray(`  Reviewer base URL: ${reviewerBaseUrl}`));
       spinner.stop();
       console.log(chalk.gray('\nProject Analysis:'));
       console.log(chalk.gray(`  Files: ${analysis.files.length}`));
@@ -411,10 +459,18 @@ export async function portProject(
 
     // Build import mapping before porting
     engine.buildImportMapping(analysis.files);
+    const apiSnapshot = buildApiSnapshot(analysis.files, options.to);
+    if (apiSnapshot) {
+      engine.setApiSnapshot(apiSnapshot);
+    }
 
     spinner.stop();
 
-    const selectedFiles = selectFilesByTestMode(analysis.files, testMode);
+    const selectedFiles = orderFilesForPorting(
+      selectFilesByTestMode(analysis.files, testMode),
+      options.from,
+      options.to
+    );
     const totalFiles = selectedFiles.length;
     console.log(chalk.cyan(`\nPorting ${totalFiles} files:\n`));
 

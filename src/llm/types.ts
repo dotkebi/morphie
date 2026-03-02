@@ -8,6 +8,7 @@ export interface GenerateOptions {
   temperature?: number;
   topP?: number;
   maxTokens?: number;
+  verbose?: boolean;
 }
 
 export interface LLMClient {

@@ -39,6 +39,8 @@ export interface PortingPromptOptions {
   chunkIndex?: number;
   totalChunks?: number;
   suppressImports?: boolean;
+  passMode?: 'default' | 'skeleton' | 'body';
+  skeletonHint?: string;
 }
 
 export class PortingEngine {
@@ -50,6 +52,8 @@ export class PortingEngine {
   private projectName: string;
   private importMapping: ImportMapping;
   private promptMode: 'full' | 'reduced' | 'minimal';
+  private apiSnapshot = '';
+  private coreSymbolTable = new Map<string, Set<string>>();
 
   constructor(
     llm: LLMClient,
@@ -75,6 +79,11 @@ export class PortingEngine {
 
   setPromptMode(mode: 'full' | 'reduced' | 'minimal'): void {
     this.promptMode = mode;
+  }
+
+  setApiSnapshot(snapshot: string): void {
+    this.apiSnapshot = snapshot.trim();
+    this.rebuildCoreSymbolTable();
   }
 
   public getTargetPath(sourcePath: string): string {
@@ -136,6 +145,7 @@ export class PortingEngine {
     options: PortingPromptOptions = {}
   ): Promise<PortedFile> {
     const targetPath = this.convertFilePath(file.relativePath);
+    const isEntryFile = this.isEntryFilePath(file.relativePath, targetPath);
     const workingFile = options.overrideContent
       ? { ...file, content: options.overrideContent }
       : file;
@@ -150,12 +160,13 @@ export class PortingEngine {
       };
     }
 
-    const maxAttempts = this.targetLanguage === 'dart' ? 4 : 3;
+    const maxAttempts = 2;
     let portedContent = '';
     let importIssues: string[] = [];
     let requiredImports: string[] = [];
     let actualImports: string[] = [];
     let lastError: string | null = null;
+    let completed = false;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       let prompt = this.buildPortingPrompt(workingFile, options);
@@ -185,7 +196,7 @@ export class PortingEngine {
         PortingEngine.hasDumpedPrompt = true;
       }
 
-      if (this.targetLanguage === 'dart' && attempt > 1 && !options.suppressImports) {
+      if (this.targetLanguage === 'dart' && attempt > 1 && !options.suppressImports && !isEntryFile) {
         requiredImports = this.getRequiredDartImports(file, targetPath);
         if (requiredImports.length > 0) {
           prompt += `\n\n## Import Correction (CRITICAL)\nYou MUST include the exact import statements below:\n${requiredImports.join('\n')}\n`;
@@ -195,6 +206,7 @@ export class PortingEngine {
       const response = await this.llm.generate(prompt, {
         temperature: 0,
         topP: 1,
+        verbose: this.verbose,
       });
 
       if (!response || response.trim() === '') {
@@ -229,11 +241,76 @@ export class PortingEngine {
       // Defer invalid-import cleanup to a final post-processing pass
 
       if (this.targetLanguage === 'dart') {
+        portedContent = this.sanitizeDartModuleSyntax(portedContent);
+        portedContent = this.mergeDuplicateDartClasses(portedContent);
+        portedContent = this.normalizeDartPowUsage(portedContent);
+        portedContent = this.normalizeDartCommonFieldIssues(portedContent);
+        let syntaxIssues = this.validateDartSyntaxHeuristics(portedContent);
+        if (options.chunked) {
+          const deferred = new Set([
+            'unbalanced braces',
+            'unbalanced parentheses',
+            'unbalanced brackets',
+          ]);
+          syntaxIssues = syntaxIssues.filter(issue => !deferred.has(issue));
+        }
+        if (syntaxIssues.length > 0) {
+          lastError = `Syntax gate failed: ${syntaxIssues.join('; ')}`;
+          if (this.verbose) {
+            const chunkLabel = options.chunked
+              ? ` chunk=${(options.chunkIndex ?? 0) + 1}/${options.totalChunks ?? 1}`
+              : '';
+            console.log(`[Porting Debug] Retry reason:${chunkLabel} attempt=${attempt} -> ${lastError}`);
+            if (process.env.MORPHIE_DEBUG_FAILED_OUTPUT === '1') {
+              const preview = portedContent.length > 800
+                ? `${portedContent.slice(0, 400)}\n...\n${portedContent.slice(-400)}`
+                : portedContent;
+              console.log(`[Porting Debug] Failed output preview (${workingFile.relativePath}) attempt=${attempt}${chunkLabel}`);
+              console.log('----- MORPHIE FAILED OUTPUT START -----');
+              console.log(preview);
+              console.log('----- MORPHIE FAILED OUTPUT END -----');
+            }
+          }
+          await this.sleep(this.getBackoffMs(attempt));
+          continue;
+        }
+        const semanticIssues = this.validateDartSemanticHeuristics(portedContent);
+        const filteredSemanticIssues = options.chunked
+          ? semanticIssues.filter(issue => !issue.startsWith('duplicate declaration:'))
+          : semanticIssues;
+        if (filteredSemanticIssues.length > 0) {
+          lastError = `Semantic gate failed: ${filteredSemanticIssues.join('; ')}`;
+          if (this.verbose) {
+            const chunkLabel = options.chunked
+              ? ` chunk=${(options.chunkIndex ?? 0) + 1}/${options.totalChunks ?? 1}`
+              : '';
+            console.log(`[Porting Debug] Retry reason:${chunkLabel} attempt=${attempt} -> ${lastError}`);
+          }
+          await this.sleep(this.getBackoffMs(attempt));
+          continue;
+        }
+        if (!options.chunked) {
+          const contractIssues = this.validateDartContractHeuristics(portedContent, file.relativePath);
+          if (contractIssues.length > 0) {
+            lastError = `Contract gate failed: ${contractIssues.join('; ')}`;
+            if (this.verbose) {
+              const chunkLabel = options.chunked
+                ? ` chunk=${(options.chunkIndex ?? 0) + 1}/${options.totalChunks ?? 1}`
+                : '';
+              console.log(`[Porting Debug] Retry reason:${chunkLabel} attempt=${attempt} -> ${lastError}`);
+            }
+            await this.sleep(this.getBackoffMs(attempt));
+            continue;
+          }
+        }
+
         portedContent = this.enforceDartRequiredNamedParams(portedContent);
         portedContent = this.enforceDartExportedConstNames(portedContent, file);
         if (!options.suppressImports) {
           portedContent = this.ensureDartRequiredImports(portedContent, file);
-          portedContent = this.normalizeDartImports(portedContent, file);
+          if (!isEntryFile) {
+            portedContent = this.normalizeDartImports(portedContent, file);
+          }
 
           const validation = this.validateDartImports(portedContent, file, targetPath);
           importIssues = validation.issues;
@@ -241,6 +318,7 @@ export class PortingEngine {
           actualImports = validation.actualImports;
 
           if (importIssues.length === 0) {
+            completed = true;
             break;
           }
           if (this.verbose) {
@@ -252,14 +330,16 @@ export class PortingEngine {
             );
           }
         } else {
+          completed = true;
           break;
         }
       } else {
+        completed = true;
         break;
       }
     }
 
-    if (!portedContent || portedContent.trim() === '') {
+    if (!completed || !portedContent || portedContent.trim() === '') {
       throw new Error(lastError ?? 'Failed to port file');
     }
 
@@ -716,15 +796,42 @@ export class PortingEngine {
     const sourceFeatures = getLanguageFeatures(this.sourceLanguage);
     const targetFeatures = getLanguageFeatures(this.targetLanguage);
     const importContext = options.suppressImports ? '' : this.buildImportContext(file);
+    const apiSnapshot = this.buildApiSnapshotNotice();
     const sourceContent = options.overrideContent ?? file.content;
+    const entryNotice = this.targetLanguage === 'dart' && this.isEntryFilePath(file.relativePath)
+      ? `
+## Entry File Rules (CRITICAL)
+- This is an entry/bridge module. Keep only valid Dart directives at the top.
+- NEVER emit JavaScript module syntax (\`import ... from\`, \`export default\`, \`module.exports\`, \`require()\`).
+- If source uses default export/re-export, convert to explicit Dart top-level declarations.
+`
+      : '';
     const chunkNotice = options.chunked
       ? `## Chunked Porting (CRITICAL)
 You are porting chunk ${options.chunkIndex! + 1} of ${options.totalChunks!} from a larger file.
 - Output ONLY the code for this chunk, in correct order.
 - Do NOT add extra commentary.
 - ${options.suppressImports ? 'Do NOT include any import statements in this chunk.' : 'Include necessary import statements only if they belong at the top of the file.'}
+- If this chunk starts a top-level class/interface/enum block, keep wrapper start (\`class Foo {\`) intact.
+- ${(options.chunkIndex ?? 0) < ((options.totalChunks ?? 1) - 1) ? 'Do NOT close the final top-level type brace in this chunk unless it is structurally required inside a method.' : 'If this chunk is the last part of a split type, close the top-level type brace.'}
 `
       : '';
+    const passNotice = options.passMode === 'skeleton'
+      ? `## Pass Mode (CRITICAL)
+This is SKELETON pass.
+- Preserve top-level structure, declarations, signatures, and class/member placement.
+- Keep method bodies minimal but syntactically valid.
+- Do NOT invent new APIs.
+`
+      : options.passMode === 'body'
+        ? `## Pass Mode (CRITICAL)
+This is BODY fill pass.
+- Keep the same declarations/signatures as skeleton.
+- Fill real implementation bodies.
+- Do NOT duplicate top-level declarations.
+${options.skeletonHint ? `Reference skeleton:\n\`\`\`${this.targetLanguage}\n${options.skeletonHint}\n\`\`\`` : ''}
+`
+        : '';
 
     const fullPrompt = `You are an expert software engineer performing a 1:1 code port from ${this.sourceLanguage} to ${this.targetLanguage}.
 
@@ -758,8 +865,11 @@ ${targetFeatures}
 12. **CRITICAL: Include ALL methods, including private methods** - If a class has \`private addListener(...)\` in TypeScript, you MUST include it as \`void _addListener(...)\` in Dart (Dart uses underscore prefix for private). Do NOT skip any methods, whether public or private.
 
 ${importContext}
+${apiSnapshot}
+${entryNotice}
 
 ${chunkNotice}
+${passNotice}
 
 ## Dart Constructor & Constant Rules (CRITICAL)
 1. **Named Parameters Validation**:
@@ -1040,7 +1150,7 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
    - Classes last - but NO "// Classes" comment
    - Functions only if they are top-level exports (not class methods) - but NO "// Functions" comment`;
     if (this.promptMode === 'reduced') {
-      return this.buildReducedPrompt(file, importContext, sourceFeatures, targetFeatures);
+      return this.buildReducedPrompt(file, importContext, sourceFeatures, targetFeatures, options);
     }
 
     return fullPrompt;
@@ -1050,8 +1160,16 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
     file: SourceFile,
     importContext: string,
     sourceFeatures: string,
-    targetFeatures: string
+    targetFeatures: string,
+    options: PortingPromptOptions = {}
   ): string {
+    const apiSnapshot = this.buildApiSnapshotNotice();
+    const sourceContent = options.overrideContent ?? file.content;
+    const passNotice = options.passMode === 'skeleton'
+      ? '\nPass mode: skeleton only. Keep signatures/structure, minimal valid bodies.\n'
+      : options.passMode === 'body'
+        ? `\nPass mode: body fill. Keep declarations/signatures from skeleton. ${options.skeletonHint ? `Skeleton:\n\`\`\`${this.targetLanguage}\n${options.skeletonHint}\n\`\`\`` : ''}\n`
+        : '';
     return `You are an expert software engineer performing a 1:1 code port from ${this.sourceLanguage} to ${this.targetLanguage}.
 
 ## Task
@@ -1084,10 +1202,12 @@ ${targetFeatures}
 12. **CRITICAL: Include ALL methods, including private methods**
 
 ${importContext}
+${apiSnapshot}
+${passNotice}
 
 ## Source Code
 \`\`\`${this.sourceLanguage}
-${file.content}
+${sourceContent}
 \`\`\`
 
 ## Output
@@ -1097,17 +1217,29 @@ Provide ONLY the ported code in ${this.targetLanguage}, wrapped in a code block.
   private buildMinimalPrompt(file: SourceFile, options: PortingPromptOptions = {}): string {
     const importContext = options.suppressImports ? '' : this.buildImportContext(file);
     const sourceContent = options.overrideContent ?? file.content;
-    const chunkNotice = options.chunked
-      ? `\nChunk ${options.chunkIndex! + 1} of ${options.totalChunks!}. ${options.suppressImports ? 'Do NOT include imports.' : 'Include imports only if appropriate at top of file.'}\n`
+    const apiSnapshot = this.buildApiSnapshotNotice();
+    const entryNotice = this.targetLanguage === 'dart' && this.isEntryFilePath(file.relativePath)
+      ? '\nEntry module: no JS module syntax, no `export default`, only valid Dart directives.\n'
       : '';
+    const chunkNotice = options.chunked
+      ? `\nChunk ${options.chunkIndex! + 1} of ${options.totalChunks!}. ${options.suppressImports ? 'Do NOT include imports.' : 'Include imports only if appropriate at top of file.'} Keep top-level type wrapper boundaries. ${(options.chunkIndex ?? 0) < ((options.totalChunks ?? 1) - 1) ? 'Do not close final top-level type brace in this chunk.' : 'Close top-level type brace if this is the final split chunk.'}\n`
+      : '';
+    const passNotice = options.passMode === 'skeleton'
+      ? '\nPass mode: skeleton. Keep declarations/signatures and minimal valid bodies.\n'
+      : options.passMode === 'body'
+        ? `\nPass mode: body fill. Keep declarations/signatures; fill implementation. ${options.skeletonHint ? `\nSkeleton reference:\n\`\`\`${this.targetLanguage}\n${options.skeletonHint}\n\`\`\`\n` : ''}`
+        : '';
     return `Port this ${this.sourceLanguage} code to ${this.targetLanguage}.
 Preserve behavior, structure, signatures, and comments.
 Include all definitions and methods (including private).
 Do not add extra commentary. Output only code in a code block.
 
 ${importContext}
+${apiSnapshot}
+${entryNotice}
 
 ${chunkNotice}
+${passNotice}
 
 Source:
 \`\`\`${this.sourceLanguage}
@@ -1200,7 +1332,9 @@ ${sourceContent}
       let isValid = false;
 
       // For package imports, extract the file path
-      if (importPath.startsWith('package:')) {
+      if (importPath.startsWith('dart:')) {
+        isValid = true;
+      } else if (importPath.startsWith('package:')) {
         const packageMatch = importPath.match(/package:([^/]+)\/(.+)/);
         if (packageMatch) {
           const packageName = packageMatch[1];
@@ -1255,8 +1389,484 @@ ${sourceContent}
     return cleanedContent.trim();
   }
 
+  private isEntryFilePath(sourceRelativePath: string, targetPath?: string): boolean {
+    const source = sourceRelativePath.replace(/\\/g, '/');
+    const target = (targetPath ?? '').replace(/\\/g, '/');
+    return source.startsWith('entry/') ||
+      source.includes('/entry/') ||
+      target.startsWith('entry/') ||
+      target.includes('/entry/');
+  }
+
+  private validateDartSyntaxHeuristics(content: string): string[] {
+    const issues: string[] = [];
+    const trimmed = content.trim();
+    if (trimmed.length === 0) {
+      issues.push('empty output');
+      return issues;
+    }
+
+    const balanceTarget = this.stripCommentsAndStringsForBalance(trimmed);
+    const count = (char: string): number => (balanceTarget.match(new RegExp(`\\${char}`, 'g')) ?? []).length;
+    if (count('{') !== count('}')) issues.push('unbalanced braces');
+    if (count('(') !== count(')')) issues.push('unbalanced parentheses');
+    if (count('[') !== count(']')) issues.push('unbalanced brackets');
+
+    if (/^\s*import\s+.+\s+from\s+['"][^'"]+['"];?\s*$/m.test(trimmed)) {
+      issues.push('contains JavaScript import-from syntax');
+    }
+    if (/^\s*export\s+default\b/m.test(trimmed)) {
+      issues.push('contains export default syntax');
+    }
+    if (/\bmodule\.exports\b/.test(trimmed)) {
+      issues.push('contains module.exports');
+    }
+    if (/\brequire\s*\(/.test(trimmed)) {
+      issues.push('contains require()');
+    }
+
+    return issues;
+  }
+
+  private stripCommentsAndStringsForBalance(source: string): string {
+    let result = '';
+    let i = 0;
+    let inLineComment = false;
+    let inBlockComment = false;
+    let inString: "'" | '"' | '`' | null = null;
+
+    while (i < source.length) {
+      const ch = source[i];
+      const next = source[i + 1];
+
+      if (inLineComment) {
+        if (ch === '\n') {
+          inLineComment = false;
+          result += '\n';
+        }
+        i += 1;
+        continue;
+      }
+      if (inBlockComment) {
+        if (ch === '*' && next === '/') {
+          inBlockComment = false;
+          i += 2;
+          continue;
+        }
+        if (ch === '\n') {
+          result += '\n';
+        }
+        i += 1;
+        continue;
+      }
+      if (inString) {
+        if (ch === '\\') {
+          i += 2;
+          continue;
+        }
+        if (ch === inString) {
+          inString = null;
+        }
+        i += 1;
+        continue;
+      }
+
+      if (ch === '/' && next === '/') {
+        inLineComment = true;
+        i += 2;
+        continue;
+      }
+      if (ch === '/' && next === '*') {
+        inBlockComment = true;
+        i += 2;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        inString = ch as "'" | '"' | '`';
+        i += 1;
+        continue;
+      }
+
+      result += ch;
+      i += 1;
+    }
+
+    return result;
+  }
+
+  private validateDartSemanticHeuristics(content: string): string[] {
+    const issues: string[] = [];
+    issues.push(...this.findDuplicateTopLevelDeclarations(content));
+    const semanticTarget = this.stripCommentsAndStringsForBalance(content);
+
+    if (/\bpow\s*\(/.test(semanticTarget) && !/^\s*import\s+['"]dart:math['"]/m.test(content)) {
+      issues.push('pow() used without dart:math import');
+    }
+
+    if (/\bint\s+\w+\s*=\s*VoiceMode\./.test(semanticTarget)) {
+      issues.push('VoiceMode assigned to int');
+    }
+    if (/\bstatic\s+(?:[A-Za-z_]\w*\s+)?get\s+mode\b/.test(semanticTarget) && /\b(?:late\s+)?(?:final\s+)?[A-Za-z_]\w*\s+mode\s*=/.test(semanticTarget)) {
+      issues.push('static/instance member name conflict: mode');
+    }
+
+    return issues;
+  }
+
+  private findDuplicateTopLevelDeclarations(content: string): string[] {
+    const issues: string[] = [];
+    const declarationRegex = /^\s*(?:abstract\s+)?(class|enum|typedef|mixin)\s+([A-Za-z_]\w*)\b/gm;
+    const seen = new Map<string, string>();
+    let match: RegExpExecArray | null;
+    while ((match = declarationRegex.exec(content)) !== null) {
+      const kind = match[1];
+      const name = match[2];
+      const existing = seen.get(name);
+      if (existing) {
+        issues.push(`duplicate declaration: ${name} (${existing}/${kind})`);
+      } else {
+        seen.set(name, kind);
+      }
+    }
+    return issues;
+  }
+
+  private buildApiSnapshotNotice(): string {
+    if (!this.apiSnapshot) {
+      return '';
+    }
+    return `\n## Core API Contract (CRITICAL)\nUse these method/type contracts exactly when referenced:\n${this.apiSnapshot}\n`;
+  }
+
+  validateFinalChunkedOutput(content: string, sourcePath: string): string[] {
+    if (this.targetLanguage !== 'dart') {
+      return [];
+    }
+    const issues: string[] = [];
+    issues.push(...this.validateDartSyntaxHeuristics(content));
+    issues.push(...this.validateDartSemanticHeuristics(content));
+    issues.push(...this.validateDartContractHeuristics(content, sourcePath));
+    return Array.from(new Set(issues));
+  }
+
+  private rebuildCoreSymbolTable(): void {
+    this.coreSymbolTable.clear();
+    if (!this.apiSnapshot) return;
+
+    const lines = this.apiSnapshot.split('\n').map(line => line.trim()).filter(Boolean);
+    for (const line of lines) {
+      const methodsMatch = line.match(/methods:\s*(.+)$/);
+      if (!methodsMatch) continue;
+      const methods = methodsMatch[1]
+        .split(',')
+        .map(item => item.trim())
+        .filter(Boolean);
+      const exportsMatch = line.match(/exports:\s*([^|]+)/);
+      if (!exportsMatch) continue;
+      const exported = exportsMatch[1].split(',').map(item => item.trim());
+      for (const entry of exported) {
+        const classMatch = entry.match(/\bclass\s+([A-Za-z_]\w*)/);
+        if (!classMatch) continue;
+        const className = classMatch[1];
+        if (!this.coreSymbolTable.has(className)) {
+          this.coreSymbolTable.set(className, new Set());
+        }
+        const bucket = this.coreSymbolTable.get(className)!;
+        for (const method of methods) {
+          bucket.add(method);
+        }
+      }
+    }
+  }
+
+  private validateDartContractHeuristics(content: string, sourcePath: string): string[] {
+    const issues: string[] = [];
+    const coreContracts: Record<string, string[]> = {
+      'src/fraction.ts': ['add', 'subtract', 'value', 'clone', 'simplify'],
+      'src/tickable.ts': ['getTicks', 'shouldIgnoreTicks', 'setVoice', 'setContext', 'drawWithStyle'],
+      'src/element.ts': ['setRendered', 'checkContext', 'getBoundingBox', 'setContext'],
+    };
+
+    const required = coreContracts[sourcePath];
+    if (!required) {
+      return issues;
+    }
+
+    const className = sourcePath.endsWith('fraction.ts')
+      ? 'Fraction'
+      : sourcePath.endsWith('tickable.ts')
+        ? 'Tickable'
+        : 'Element';
+
+    const classBody = this.extractDartClassBody(content, className);
+    if (!classBody) {
+      issues.push(`missing class ${className}`);
+      return issues;
+    }
+
+    for (const method of required) {
+      const methodPattern = new RegExp(`\\b${this.escapeRegex(method)}\\s*\\(`);
+      if (!methodPattern.test(classBody)) {
+        issues.push(`${className}.${method} missing`);
+      }
+    }
+
+    return issues;
+  }
+
+  private extractDartClassBody(content: string, className: string): string | null {
+    const classRegex = new RegExp(`\\b(?:abstract\\s+)?class\\s+${this.escapeRegex(className)}\\b[^\\{]*\\{`, 'g');
+    const match = classRegex.exec(content);
+    if (!match) return null;
+    const openBrace = content.indexOf('{', match.index);
+    if (openBrace < 0) return null;
+    const closeBrace = this.findMatchingBrace(content, openBrace);
+    if (closeBrace < 0) return null;
+    return content.slice(openBrace + 1, closeBrace);
+  }
+
   finalizeImportsForTarget(content: string, currentFilePath: string): string {
-    return this.removeInvalidImports(content, currentFilePath);
+    let updated = content;
+    if (this.targetLanguage === 'dart') {
+      updated = this.sanitizeDartModuleSyntax(updated);
+      updated = this.normalizeDartPowUsage(updated);
+      updated = this.normalizeDartCommonFieldIssues(updated);
+      updated = this.narrowDartImportsByUsage(updated);
+    }
+    return this.removeInvalidImports(updated, currentFilePath);
+  }
+
+  finalizeDartChunkedContent(content: string, file: SourceFile): string {
+    if (this.targetLanguage !== 'dart') {
+      return content;
+    }
+
+    const targetPath = this.convertFilePath(file.relativePath);
+    const isEntryFile = this.isEntryFilePath(file.relativePath, targetPath);
+
+    let updated = this.sanitizeDartModuleSyntax(content);
+    updated = this.mergeDuplicateDartClasses(updated);
+    updated = this.normalizeDartPowUsage(updated);
+    updated = this.normalizeDartCommonFieldIssues(updated);
+    updated = this.narrowDartImportsByUsage(updated);
+    updated = this.ensureDartRequiredImports(updated, file);
+    if (!isEntryFile) {
+      updated = this.normalizeDartImports(updated, file);
+    }
+    return this.removeInvalidImports(updated, targetPath);
+  }
+
+  private narrowDartImportsByUsage(content: string): string {
+    const lines = content.split('\n');
+    const usesTables = /\bTables\./.test(content);
+    const updated = lines.map(line => {
+      const trimmed = line.trim();
+      if (!usesTables && /import\s+['"][^'"]*tables\.dart['"]/.test(trimmed)) {
+        return '';
+      }
+      if (usesTables && /import\s+['"][^'"]*tables\.dart['"]/.test(trimmed) && !/\bshow\b/.test(trimmed)) {
+        return line.replace(/;?\s*$/, " show Tables;");
+      }
+      return line;
+    });
+    return updated.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  private normalizeDartPowUsage(content: string): string {
+    const hasPowCall = /\bpow\s*\(/.test(content) || /\bmath\.pow\s*\(/.test(content);
+    if (!hasPowCall) {
+      return content;
+    }
+
+    let updated = content.replace(/(^|[^.\w])pow\s*\(/g, '$1math.pow(');
+    if (!/^\s*import\s+['"]dart:math['"]\s+as\s+math;?\s*$/m.test(updated)) {
+      const lines = updated.split('\n');
+      let insertAt = 0;
+      for (let i = 0; i < lines.length; i += 1) {
+        const trimmed = lines[i].trim();
+        if (
+          trimmed.startsWith('library ') ||
+          trimmed.startsWith('part of ') ||
+          trimmed.startsWith('part ') ||
+          trimmed.startsWith('import ') ||
+          trimmed.startsWith('export ')
+        ) {
+          insertAt = i + 1;
+          continue;
+        }
+        if (trimmed !== '') {
+          break;
+        }
+      }
+      lines.splice(insertAt, 0, "import 'dart:math' as math;");
+      updated = lines.join('\n').replace(/\n{3,}/g, '\n\n');
+    }
+    return updated.trim();
+  }
+
+  private normalizeDartCommonFieldIssues(content: string): string {
+    let updated = content;
+
+    updated = updated.replace(/\bstatic\s+([A-Za-z_]\w*\s+)?get\s+mode\b/g, (_m, typePart = '') => `static ${typePart}get Mode`);
+    updated = updated.replace(/\bint\s+mode\s*=\s*VoiceMode\./g, 'VoiceMode mode = VoiceMode.');
+
+    const finalFieldRegex = /^\s*final\s+([A-Za-z0-9_<>, ?]+)\s+([A-Za-z_]\w*)\s*;\s*$/gm;
+    let match: RegExpExecArray | null;
+    const toLate = new Set<string>();
+    while ((match = finalFieldRegex.exec(updated)) !== null) {
+      const fieldName = match[2];
+      const assignRegex = new RegExp(`\\b(?:this\\.)?${this.escapeRegex(fieldName)}\\s*=`, 'g');
+      let hitCount = 0;
+      while (assignRegex.exec(updated) !== null) {
+        hitCount += 1;
+        if (hitCount > 1) {
+          toLate.add(fieldName);
+          break;
+        }
+      }
+    }
+
+    if (toLate.size > 0) {
+      updated = updated.replace(finalFieldRegex, (line, typeName: string, fieldName: string) => {
+        if (!toLate.has(fieldName)) return line;
+        return `late ${typeName.trim()} ${fieldName};`;
+      });
+    }
+
+    return updated;
+  }
+
+  private sanitizeDartModuleSyntax(content: string): string {
+    const lines = content.split('\n');
+    const directives: string[] = [];
+    const body: string[] = [];
+
+    const normalizeDirective = (raw: string): string | null => {
+      const line = raw.trim();
+      if (line.length === 0) return null;
+
+      const jsImportFrom = line.match(/^import\s+.+\s+from\s+['"]([^'"]+)['"];?$/);
+      if (jsImportFrom) {
+        return `import '${jsImportFrom[1]}';`;
+      }
+
+      const jsExportFrom = line.match(/^export\s+.+\s+from\s+['"]([^'"]+)['"];?$/);
+      if (jsExportFrom) {
+        return `export '${jsExportFrom[1]}';`;
+      }
+
+      if (/^\s*(import|export|part|library)\b/.test(line)) {
+        let normalized = line.replace(/\sas\s+default\b/g, ' as default_');
+        if (!normalized.endsWith(';')) {
+          normalized = `${normalized};`;
+        }
+
+        if (/^(import|export|part)\s+['"][^'"]+['"](?:\s+as\s+[A-Za-z_]\w*)?;?$/.test(normalized)) {
+          return normalized;
+        }
+        if (/^library\s+[A-Za-z_][\w.]*;?$/.test(normalized)) {
+          return normalized;
+        }
+      }
+
+      return null;
+    };
+
+    for (const line of lines) {
+      const normalizedDirective = normalizeDirective(line);
+      if (normalizedDirective) {
+        directives.push(normalizedDirective);
+      } else {
+        body.push(line);
+      }
+    }
+
+    const uniqueDirectives = Array.from(new Set(directives));
+    const trimmedBody = body.join('\n').replace(/^\s+/, '');
+
+    if (uniqueDirectives.length === 0) {
+      return content;
+    }
+
+    return `${uniqueDirectives.join('\n')}\n\n${trimmedBody}`.replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  private mergeDuplicateDartClasses(content: string): string {
+    const classRegex = /\bclass\s+([A-Za-z_]\w*)[^{]*\{/g;
+    type Block = { name: string; start: number; openBrace: number; end: number; header: string; body: string };
+    const blocks: Block[] = [];
+    let match: RegExpExecArray | null;
+
+    while ((match = classRegex.exec(content)) !== null) {
+      const name = match[1];
+      const openBrace = content.indexOf('{', match.index);
+      if (openBrace < 0) continue;
+      const closeBrace = this.findMatchingBrace(content, openBrace);
+      if (closeBrace < 0) continue;
+      const header = content.slice(match.index, openBrace + 1);
+      const body = content.slice(openBrace + 1, closeBrace).trim();
+      blocks.push({ name, start: match.index, openBrace, end: closeBrace + 1, header, body });
+      classRegex.lastIndex = closeBrace + 1;
+    }
+
+    if (blocks.length < 2) return content;
+
+    const byName = new Map<string, Block[]>();
+    for (const block of blocks) {
+      const list = byName.get(block.name) ?? [];
+      list.push(block);
+      byName.set(block.name, list);
+    }
+
+    const replacementRanges: Array<{ start: number; end: number; replacement: string }> = [];
+    for (const duplicates of byName.values()) {
+      if (duplicates.length < 2) continue;
+      duplicates.sort((a, b) => a.start - b.start);
+      const first = duplicates[0];
+      const mergedBody = duplicates
+        .map(item => item.body)
+        .filter(Boolean)
+        .join('\n\n')
+        .trim();
+      const merged = `${first.header}\n${mergedBody}\n}`;
+      replacementRanges.push({ start: first.start, end: first.end, replacement: merged });
+      for (let i = 1; i < duplicates.length; i += 1) {
+        replacementRanges.push({ start: duplicates[i].start, end: duplicates[i].end, replacement: '' });
+      }
+    }
+
+    if (replacementRanges.length === 0) return content;
+    replacementRanges.sort((a, b) => b.start - a.start);
+    let updated = content;
+    for (const range of replacementRanges) {
+      updated = `${updated.slice(0, range.start)}${range.replacement}${updated.slice(range.end)}`;
+    }
+
+    return updated.replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  private findMatchingBrace(source: string, openBraceIndex: number): number {
+    let depth = 0;
+    let inString: '"' | "'" | null = null;
+    for (let i = openBraceIndex; i < source.length; i += 1) {
+      const ch = source[i];
+      if (inString) {
+        if (ch === inString && source[i - 1] !== '\\') {
+          inString = null;
+        }
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        inString = ch;
+        continue;
+      }
+      if (ch === '{') depth += 1;
+      if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) return i;
+      }
+    }
+    return -1;
   }
 
   private convertFilePath(sourcePath: string): string {

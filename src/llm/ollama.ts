@@ -51,10 +51,25 @@ export class OllamaClient implements LLMClient {
 
   async generate(prompt: string, options?: GenerateOptions): Promise<string> {
     const opts = { ...this.defaultOptions, ...options };
+    const startedAt = Date.now();
+    const verbose = options?.verbose === true;
 
     console.log(`[Ollama Debug] Generating with model: ${this.model}`);
     console.log(`[Ollama Debug] Prompt length: ${prompt.length}`);
-    return this.fetchGenerateStream(prompt, opts, () => {});
+    try {
+      const response = await this.fetchGenerateStream(prompt, opts, () => {});
+      if (verbose) {
+        const elapsedMs = Date.now() - startedAt;
+        console.log(`[Ollama Debug] Response time: ${elapsedMs}ms`);
+      }
+      return response;
+    } catch (error) {
+      if (verbose) {
+        const elapsedMs = Date.now() - startedAt;
+        console.log(`[Ollama Debug] Response time (failed): ${elapsedMs}ms`);
+      }
+      throw error;
+    }
   }
 
   async generateStream(

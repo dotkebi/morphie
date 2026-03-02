@@ -10,9 +10,10 @@ import { DeepAnalyzer } from '../tools/analysis/deep-analyzer.js';
 import { FilePorter } from '../tools/porting/file-porter.js';
 import { SyntaxChecker } from '../tools/verification/syntax-checker.js';
 import { DartAnalyzer } from '../tools/verification/dart-analyzer.js';
-import { ProjectAnalyzer } from './analyzer.js';
+import { ProjectAnalyzer, type SourceFile } from './analyzer.js';
 import { FileSystem } from '../utils/filesystem.js';
 import { addDartDependencies, generateProjectFiles } from '../utils/project-config.js';
+import { orderFilesForPorting } from '../utils/porting-order.js';
 import { SessionManager, type PortingSession } from '../utils/session.js';
 import path from 'path';
 import crypto from 'crypto';
@@ -77,7 +78,7 @@ class AdaptiveSemaphore {
     }
 }
 
-type TestMode = 'mixed' | 'defer' | 'only' | 'skip';
+type TestMode = 'skip' | 'only';
 
 export class AgentOrchestrator {
     private llm: LLMClient;
@@ -127,7 +128,7 @@ export class AgentOrchestrator {
      */
     private registerTools(): void {
         this.toolRegistry.register(new DeepAnalyzer());
-        this.toolRegistry.register(new FilePorter(this.llm, { maxRetries: 6 }));
+        this.toolRegistry.register(new FilePorter(this.llm, { maxRetries: 2 }));
         this.toolRegistry.register(new SyntaxChecker());
         this.toolRegistry.register(new DartAnalyzer());
     }
@@ -301,6 +302,7 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         try {
             const response = await this.llm.generate(prompt, {
                 temperature: 0.3,
+                verbose: this.verbose,
             });
 
             return this.extractJSON(response);
@@ -584,11 +586,13 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         // Port each file
         const completed = new Set(this.session?.completedFiles ?? []);
         const fileHashes = this.session?.fileHashes ?? {};
-        const testMode = (task.testMode ?? 'mixed') as TestMode;
+        const testMode = (task.testMode ?? 'skip') as TestMode;
         const baseFiles = this.selectFilesByTestMode(projectAnalysis.files, testMode);
+        const orderedBaseFiles = orderFilesForPorting(baseFiles, task.sourceLanguage, task.targetLanguage);
         const filesToPort = onlyFiles
-            ? baseFiles.filter(file => onlyFiles.has(file.relativePath))
-            : baseFiles;
+            ? orderedBaseFiles.filter(file => onlyFiles.has(file.relativePath))
+            : orderedBaseFiles;
+        const apiSnapshot = this.buildApiSnapshot(orderedBaseFiles, task.targetLanguage);
         const totalToPort = filesToPort.length;
         const baseConcurrency = Math.max(1, task.concurrency ?? 2);
         const autoConcurrency = task.autoConcurrency !== false;
@@ -627,7 +631,9 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
                     sourceLanguage: task.sourceLanguage,
                     targetLanguage: task.targetLanguage,
                     projectName: task.targetPath.split('/').pop() || 'project',
+                    targetPath: task.targetPath,
                     allFiles: projectAnalysis.files,
+                    apiSnapshot,
                     verbose: this.verbose,
                 });
 
@@ -756,16 +762,55 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         const nonTestFiles = files.filter(file => file.type !== 'test');
 
         switch (mode) {
-            case 'defer':
-                return [...nonTestFiles, ...testFiles];
             case 'only':
                 return testFiles;
             case 'skip':
-                return nonTestFiles;
-            case 'mixed':
             default:
-                return files;
+                return nonTestFiles;
         }
+    }
+
+    private buildApiSnapshot(files: SourceFile[], targetLanguage: string): string {
+        if (targetLanguage !== 'dart') {
+            return '';
+        }
+
+        const coreTargets = new Set([
+            'src/element.ts',
+            'src/tickable.ts',
+            'src/fraction.ts',
+            'src/tables.ts',
+            'src/typeguard.ts',
+            'src/util.ts',
+            'src/boundingbox.ts',
+            'src/rendercontext.ts',
+            'src/stave.ts',
+        ]);
+
+        const sections: string[] = [];
+        for (const file of files) {
+            if (!coreTargets.has(file.relativePath)) {
+                continue;
+            }
+            const symbols = file.exports.map(symbol => `${symbol.type} ${symbol.name}`).slice(0, 20);
+            const methodMatches = Array.from(file.content.matchAll(/\b(?:public|private|protected|static\s+)?([A-Za-z_]\w*)\s*\([^)]*\)\s*\{/g))
+                .map(match => match[1])
+                .filter(name => !['if', 'for', 'while', 'switch', 'catch'].includes(name))
+                .slice(0, 30);
+            const uniqMethods = Array.from(new Set(methodMatches));
+            const lines: string[] = [];
+            if (symbols.length > 0) {
+                lines.push(`exports: ${symbols.join(', ')}`);
+            }
+            if (uniqMethods.length > 0) {
+                lines.push(`methods: ${uniqMethods.join(', ')}`);
+            }
+            if (lines.length > 0) {
+                sections.push(`- ${file.relativePath}: ${lines.join(' | ')}`);
+            }
+        }
+
+        return sections.slice(0, 20).join('\n');
     }
 
     private async generateProjectFilesIfNeeded(task: PortingTask): Promise<void> {

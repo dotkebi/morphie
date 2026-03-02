@@ -19,10 +19,14 @@ program
   .argument('<target>', 'Target output directory')
   .requiredOption('-f, --from <language>', 'Source language (e.g., python, javascript, go)')
   .requiredOption('-t, --to <language>', 'Target language (e.g., rust, typescript, java)')
-  .option('-m, --model <model>', 'LLM model to use (default: qwen3-coder:30b)', 'qwen3-coder:30b')
+  .option('-m, --model <model>', 'LLM model to use (default: qwen3-coder:30b-a3b-q8_0)', 'qwen3-coder:30b-a3b-q8_0')
   .option('--provider <provider>', 'LLM provider: ollama|openai', 'ollama')
   .option('--base-url <url>', 'LLM API base URL (overrides --ollama-url if set)')
   .option('--api-key <key>', 'API key for OpenAI-compatible providers')
+  .option('--reviewer-model <model>', 'Reviewer model for failure-retry stage (default: deepseek-r1:70b)')
+  .option('--reviewer-provider <provider>', 'Reviewer provider: ollama|openai (defaults to --provider)')
+  .option('--reviewer-base-url <url>', 'Reviewer API base URL (defaults to --base-url/--ollama-url)')
+  .option('--reviewer-api-key <key>', 'API key for reviewer provider (defaults to --api-key)')
   .option('--ollama-url <url>', 'Ollama API URL', 'http://localhost:11434')
   .option('--dry-run', 'Analyze without actually porting')
   .option('-v, --verbose', 'Verbose output')
@@ -43,7 +47,7 @@ program
   .option('--refresh-understanding', 'Recompute agent understanding even when resuming')
   .option('--concurrency <count>', 'Number of files to port in parallel', '2')
   .option('--no-auto-concurrency', 'Disable adaptive concurrency')
-  .option('--test-mode <mode>', 'How to port test files: mixed|defer|only|skip', 'mixed')
+  .option('--test-mode <mode>', 'How to port test files: skip|only', 'skip')
   .action(portProject);
 
 program
