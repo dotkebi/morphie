@@ -469,7 +469,8 @@ export async function portProject(
     const selectedFiles = orderFilesForPorting(
       selectFilesByTestMode(analysis.files, testMode),
       options.from,
-      options.to
+      options.to,
+      analysis.dependencyGraph
     );
     const totalFiles = selectedFiles.length;
     console.log(chalk.cyan(`\nPorting ${totalFiles} files:\n`));

@@ -27,6 +27,12 @@ export interface ProjectAnalysis {
   entryPoints: string[];
   dependencies: string[];
   structure: ProjectStructure;
+  dependencyGraph: FileDependencyGraph;
+}
+
+export interface FileDependencyGraph {
+  // File -> local dependency files (same project, relative path keys)
+  edges: Record<string, string[]>;
 }
 
 export interface ProjectStructure {
@@ -54,6 +60,7 @@ export class ProjectAnalyzer {
     const entryPoints = this.findEntryPoints(files, language);
     const dependencies = await this.extractDependencies(language);
     const structure = await this.analyzeStructure();
+    const dependencyGraph = this.buildDependencyGraph(files, language);
 
     return {
       language,
@@ -61,7 +68,72 @@ export class ProjectAnalyzer {
       entryPoints,
       dependencies,
       structure,
+      dependencyGraph,
     };
+  }
+
+  private buildDependencyGraph(files: SourceFile[], language: string): FileDependencyGraph {
+    const edges: Record<string, string[]> = {};
+    const lang = language.toLowerCase();
+    const isScript = lang === 'typescript' || lang === 'javascript';
+
+    const fileSet = new Set(files.map(file => file.relativePath.replace(/\\/g, '/')));
+    for (const file of files) {
+      const filePath = file.relativePath.replace(/\\/g, '/');
+      edges[filePath] = [];
+      if (!isScript) continue;
+      const imports = this.extractLocalImports(file.content);
+      for (const importPath of imports) {
+        const resolved = this.resolveLocalImport(importPath, filePath, fileSet);
+        if (!resolved || resolved === filePath) continue;
+        if (!edges[filePath].includes(resolved)) {
+          edges[filePath].push(resolved);
+        }
+      }
+    }
+    return { edges };
+  }
+
+  private extractLocalImports(content: string): string[] {
+    const imports = new Set<string>();
+    const patterns = [
+      /import\s+[^'"]*from\s+['"]([^'"]+)['"]/g,
+      /import\s+['"]([^'"]+)['"]/g,
+      /export\s+[^'"]*from\s+['"]([^'"]+)['"]/g,
+      /require\(\s*['"]([^'"]+)['"]\s*\)/g,
+    ];
+
+    for (const pattern of patterns) {
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(content)) !== null) {
+        const importPath = match[1];
+        if (importPath.startsWith('.')) {
+          imports.add(importPath);
+        }
+      }
+    }
+
+    return Array.from(imports);
+  }
+
+  private resolveLocalImport(importPath: string, fromFile: string, fileSet: Set<string>): string | null {
+    const fromDir = path.posix.dirname(fromFile);
+    const base = path.posix.normalize(path.posix.join(fromDir, importPath));
+    const candidates = [
+      base,
+      `${base}.ts`,
+      `${base}.tsx`,
+      `${base}.js`,
+      `${base}.jsx`,
+      path.posix.join(base, 'index.ts'),
+      path.posix.join(base, 'index.tsx'),
+      path.posix.join(base, 'index.js'),
+      path.posix.join(base, 'index.jsx'),
+    ];
+    for (const candidate of candidates) {
+      if (fileSet.has(candidate)) return candidate;
+    }
+    return null;
   }
 
   private async detectProjectLanguage(): Promise<string> {

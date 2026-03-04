@@ -1,4 +1,5 @@
 import path from 'path';
+import type { FileDependencyGraph } from '../core/analyzer.js';
 
 export interface FileForOrdering {
   relativePath: string;
@@ -87,7 +88,8 @@ function sortByPriority(paths: string[], targetLanguage: string): string[] {
 export function orderFilesForPorting<T extends FileForOrdering>(
   files: T[],
   sourceLanguage: string,
-  targetLanguage: string
+  targetLanguage: string,
+  dependencyGraph?: FileDependencyGraph
 ): T[] {
   if (files.length <= 1) {
     return files;
@@ -111,13 +113,25 @@ export function orderFilesForPorting<T extends FileForOrdering>(
     indegree.set(filePath, 0);
   }
 
-  for (const file of files) {
-    const filePath = file.relativePath.replace(/\\/g, '/');
-    const locals = extractLocalImports(file.content);
-    for (const localImport of locals) {
-      const dep = resolveLocalImport(localImport, filePath, fileSet);
-      if (!dep || dep === filePath) continue;
-      depsByFile.get(filePath)!.add(dep);
+  if (dependencyGraph?.edges) {
+    for (const [filePathRaw, depsRaw] of Object.entries(dependencyGraph.edges)) {
+      const filePath = filePathRaw.replace(/\\/g, '/');
+      if (!fileSet.has(filePath)) continue;
+      for (const depRaw of depsRaw) {
+        const dep = depRaw.replace(/\\/g, '/');
+        if (!fileSet.has(dep) || dep === filePath) continue;
+        depsByFile.get(filePath)!.add(dep);
+      }
+    }
+  } else {
+    for (const file of files) {
+      const filePath = file.relativePath.replace(/\\/g, '/');
+      const locals = extractLocalImports(file.content);
+      for (const localImport of locals) {
+        const dep = resolveLocalImport(localImport, filePath, fileSet);
+        if (!dep || dep === filePath) continue;
+        depsByFile.get(filePath)!.add(dep);
+      }
     }
   }
 

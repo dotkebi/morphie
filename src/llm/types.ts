@@ -9,6 +9,7 @@ export interface GenerateOptions {
   topP?: number;
   maxTokens?: number;
   verbose?: boolean;
+  timeoutMs?: number;
 }
 
 export interface LLMClient {

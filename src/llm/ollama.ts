@@ -100,6 +100,7 @@ export class OllamaClient implements LLMClient {
     });
 
     return await new Promise<string>((resolve, reject) => {
+      let timedOut = false;
       const req = client.request(
         {
           method: 'POST',
@@ -176,8 +177,17 @@ export class OllamaClient implements LLMClient {
         }
       );
 
-      req.setTimeout(0);
+      const timeoutMs = opts.timeoutMs ?? 0;
+      req.setTimeout(timeoutMs);
+      req.on('timeout', () => {
+        timedOut = true;
+        req.destroy(new Error(`LLM request timed out after ${timeoutMs}ms`));
+      });
       req.on('error', (err: NodeJS.ErrnoException) => {
+        if (timedOut) {
+          reject(new Error(err.message || 'LLM request timed out'));
+          return;
+        }
         console.error(`[Ollama Debug] Request error: ${err.message}${err.code ? ` (code: ${err.code})` : ''}`);
         reject(err);
       });

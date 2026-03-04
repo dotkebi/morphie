@@ -588,7 +588,12 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         const fileHashes = this.session?.fileHashes ?? {};
         const testMode = (task.testMode ?? 'skip') as TestMode;
         const baseFiles = this.selectFilesByTestMode(projectAnalysis.files, testMode);
-        const orderedBaseFiles = orderFilesForPorting(baseFiles, task.sourceLanguage, task.targetLanguage);
+        const orderedBaseFiles = orderFilesForPorting(
+            baseFiles,
+            task.sourceLanguage,
+            task.targetLanguage,
+            projectAnalysis.dependencyGraph
+        );
         const filesToPort = onlyFiles
             ? orderedBaseFiles.filter(file => onlyFiles.has(file.relativePath))
             : orderedBaseFiles;

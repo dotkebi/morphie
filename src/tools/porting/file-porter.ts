@@ -79,7 +79,8 @@ export class FilePorter extends BaseTool {
             let reviewerEscalated = false;
             let useReviewer = false;
 
-            while (attempts < this.options.maxRetries) {
+            let maxAttempts = this.options.maxRetries;
+            while (attempts < maxAttempts) {
                 attempts++;
 
                 try {
@@ -169,6 +170,9 @@ export class FilePorter extends BaseTool {
 
                 } catch (error) {
                     lastError = error instanceof Error ? error.message : String(error);
+                    if (lastError.includes('Combined chunk validation failed')) {
+                        maxAttempts = Math.max(maxAttempts, 3);
+                    }
                     if (!reviewerEscalated && this.shouldEscalateToReviewer(lastError)) {
                         const reviewer = this.getReviewerClient();
                         reviewerEscalated = true;
@@ -269,10 +273,11 @@ export class FilePorter extends BaseTool {
         const literalTokens = objectArrayTokens + quoteCount;
         const literalRatio = literalTokens / Math.max(1, content.length);
         const densityScore = literalTokens - (controlCount * 25);
+        const hasGlyphMapShape = /\bexport\s+const\b[\s\S]{0,200}\bglyphs\s*:\s*\{/.test(content);
         return exportConstCount >= 1 &&
             controlCount <= 6 &&
-            densityScore >= 1400 &&
-            literalRatio >= 0.005;
+            (hasGlyphMapShape || densityScore >= 500) &&
+            literalRatio >= 0.003;
     }
 
     private async tryDeterministicDataPort(
@@ -508,6 +513,10 @@ ${portedCode}
         targetLanguage: string,
         targetRoot?: string
     ): Promise<PortedFile> {
+        if (targetLanguage === 'dart' && this.canUseTypeScriptAst(sourceLanguage, file.relativePath)) {
+            return this.portByDeclarations(engine, file, sourceLanguage, targetLanguage);
+        }
+
         engine.setPromptMode('minimal');
         const isEntryFile = this.isEntryFilePath(file.relativePath);
         const checkpoint = await this.loadChunkCheckpoint(file, targetRoot);
@@ -588,7 +597,14 @@ ${portedCode}
         let combined = normalizedOutputs.join('\n\n').trim();
         if (targetLanguage === 'dart') {
             combined = engine.finalizeDartChunkedContent(combined, file);
-            const finalIssues = engine.validateFinalChunkedOutput(combined, file.relativePath);
+            let finalIssues = engine.validateFinalChunkedOutput(combined, file.relativePath);
+            if (finalIssues.some(issue => issue.endsWith(' missing'))) {
+                const fallback = engine.applyContractStubFallback(combined, file.relativePath, finalIssues);
+                if (fallback.injected.length > 0) {
+                    combined = engine.finalizeDartChunkedContent(fallback.content, file);
+                    finalIssues = engine.validateFinalChunkedOutput(combined, file.relativePath);
+                }
+            }
             if (finalIssues.length > 0) {
                 throw new Error(`Combined chunk validation failed: ${finalIssues.join('; ')}`);
             }
@@ -601,6 +617,102 @@ ${portedCode}
             sourceLanguage,
             targetLanguage,
         };
+    }
+
+    private async portByDeclarations(
+        engine: PortingEngine,
+        file: any,
+        sourceLanguage: string,
+        targetLanguage: string
+    ): Promise<PortedFile> {
+        const declarations = await this.splitWithTypeScriptAst(file.content, 1, file.relativePath);
+        const outputUnits: string[] = [];
+
+        for (const decl of declarations) {
+            const trimmed = decl.trim();
+            if (!trimmed) continue;
+            if (/^\s*(import|export\s+\*)\b/.test(trimmed)) continue;
+
+            if (this.looksLikeClassDeclaration(trimmed)) {
+                const classOut = await this.portClassDeclarationTwoPass(engine, file, trimmed);
+                outputUnits.push(classOut);
+                continue;
+            }
+
+            const out = await engine.portDeclarationWithJson(file, trimmed);
+            if (out.trim()) {
+                outputUnits.push(this.stripImports(out));
+            }
+        }
+
+        let combined = outputUnits.join('\n\n').trim();
+        if (targetLanguage === 'dart') {
+            combined = engine.finalizeDartChunkedContent(combined, file);
+            let finalIssues = engine.validateFinalChunkedOutput(combined, file.relativePath);
+            if (finalIssues.some(issue => issue.endsWith(' missing'))) {
+                const fallback = engine.applyContractStubFallback(combined, file.relativePath, finalIssues);
+                if (fallback.injected.length > 0) {
+                    combined = engine.finalizeDartChunkedContent(fallback.content, file);
+                    finalIssues = engine.validateFinalChunkedOutput(combined, file.relativePath);
+                }
+            }
+            if (finalIssues.length > 0) {
+                throw new Error(`Combined chunk validation failed: ${finalIssues.join('; ')}`);
+            }
+        }
+
+        return {
+            targetPath: engine.getTargetPath(file.relativePath),
+            content: combined,
+            originalPath: file.relativePath,
+            sourceLanguage,
+            targetLanguage,
+        };
+    }
+
+    private async portClassDeclarationTwoPass(
+        engine: PortingEngine,
+        file: any,
+        classSource: string
+    ): Promise<string> {
+        const decomposed = await this.decomposeClassDeclaration(classSource, file.relativePath);
+        if (!decomposed) {
+            return this.stripImports(await engine.portDeclarationWithJson(file, classSource));
+        }
+
+        const skeleton = await engine.portDeclarationWithJson(file, classSource, { passMode: 'skeleton' });
+        const envelope = this.extractClassEnvelope(skeleton, decomposed.className);
+        if (!envelope) {
+            return this.stripImports(await engine.portDeclarationWithJson(file, classSource, {
+                passMode: 'body',
+                skeletonHint: skeleton.slice(0, 3000),
+            }));
+        }
+
+        const memberOutputs: string[] = [];
+        for (const member of decomposed.members) {
+            const converted = await engine.portClassMemberWithJson(
+                member,
+                decomposed.className,
+                skeleton.slice(0, 3000)
+            );
+            if (converted.trim()) {
+                memberOutputs.push(converted.trim());
+            }
+        }
+        const assembled = `${envelope.header}\n${memberOutputs.join('\n\n')}\n${envelope.footer}`.trim();
+        const sourceMethods = this.extractSourceClassMethodNames(classSource, decomposed.className);
+        const missing = sourceMethods.filter(name => !this.dartClassHasMethod(assembled, name));
+        if (missing.length === 0) {
+            return assembled;
+        }
+
+        // Fallback: request full class body pass to preserve missing APIs.
+        return this.stripImports(await engine.portDeclarationWithJson(file, classSource, {
+            passMode: 'body',
+            skeletonHint: skeleton.slice(0, 3000),
+            classNameHint: decomposed.className,
+        }));
     }
 
     private async loadChunkCheckpoint(
@@ -859,6 +971,11 @@ ${portedCode}
                 continue;
             }
 
+            if (/^\s*(?:export\s+)?(?:abstract\s+)?class\s+[A-Za-z_]\w*/.test(candidate)) {
+                limited.push(candidate);
+                continue;
+            }
+
             const lines = candidate.split('\n');
             if (lines.length <= maxLinesToSplit) {
                 limited.push(candidate);
@@ -933,19 +1050,14 @@ ${portedCode}
             scriptKind
         );
 
-        const targetSize = Math.max(2000, Math.ceil(content.length / chunkCount));
         const units: string[] = [];
 
         for (const statement of sourceFile.statements) {
-            if (ts.isClassDeclaration(statement) && statement.members.length > 6) {
-                units.push(...this.splitClassByMembers(content, statement, targetSize));
-            } else {
-                const unitText = content
-                    .slice(statement.getFullStart(), statement.getEnd())
-                    .trim();
-                if (unitText.length > 0) {
-                    units.push(unitText);
-                }
+            const unitText = content
+                .slice(statement.getFullStart(), statement.getEnd())
+                .trim();
+            if (unitText.length > 0) {
+                units.push(unitText);
             }
         }
 
@@ -1056,6 +1168,72 @@ ${portedCode}
             index = boundary + targetLinesPerChunk;
         }
         return boundaries;
+    }
+
+    private looksLikeClassDeclaration(text: string): boolean {
+        return /^\s*(?:export\s+)?(?:abstract\s+)?class\s+[A-Za-z_]\w*/.test(text);
+    }
+
+    private async decomposeClassDeclaration(
+        classSource: string,
+        filePath: string
+    ): Promise<{ className: string; members: string[] } | null> {
+        try {
+            const ts = await import('typescript');
+            const sf = ts.createSourceFile(
+                filePath || 'class.ts',
+                classSource,
+                ts.ScriptTarget.Latest,
+                true,
+                this.getScriptKind(ts, filePath)
+            );
+            const cls = sf.statements.find((s: any) => ts.isClassDeclaration(s)) as any;
+            if (!cls || !cls.name?.text) return null;
+            const className = String(cls.name.text);
+            const members = cls.members
+                .map((m: any) => classSource.slice(m.getFullStart(), m.getEnd()).trim())
+                .filter((m: string) => m.length > 0);
+            return { className, members };
+        } catch {
+            return null;
+        }
+    }
+
+    private extractClassEnvelope(
+        classText: string,
+        className: string
+    ): { header: string; footer: string } | null {
+        const re = new RegExp(`\\b(?:abstract\\s+)?class\\s+${className}\\b[^\\{]*\\{`, 'm');
+        const m = re.exec(classText);
+        if (!m || m.index === undefined) return null;
+        const open = classText.indexOf('{', m.index);
+        if (open < 0) return null;
+        const close = classText.lastIndexOf('}');
+        if (close <= open) return null;
+        const header = classText.slice(m.index, open + 1).trim();
+        const footerRaw = classText.slice(close).trim();
+        const footer = footerRaw.startsWith('}') ? footerRaw : '}';
+        return { header, footer };
+    }
+
+    private extractSourceClassMethodNames(classSource: string, className: string): string[] {
+        const names = new Set<string>();
+        const methodRegex = /\b(?:public|private|protected)?\s*(?:static\s+)?([A-Za-z_]\w*)\s*\([^)]*\)\s*\{/g;
+        let match: RegExpExecArray | null;
+        while ((match = methodRegex.exec(classSource)) !== null) {
+            const name = match[1];
+            if (name === className) continue;
+            if (['if', 'for', 'while', 'switch', 'catch'].includes(name)) continue;
+            names.add(name);
+        }
+        return Array.from(names);
+    }
+
+    private dartClassHasMethod(classSource: string, methodName: string): boolean {
+        const escaped = methodName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const direct = new RegExp(`\\b${escaped}\\s*\\(`);
+        const privateName = new RegExp(`\\b_${escaped}\\s*\\(`);
+        return direct.test(classSource) || privateName.test(classSource);
     }
 
     private isEntryFilePath(filePath: string): boolean {

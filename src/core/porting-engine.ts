@@ -43,6 +43,13 @@ export interface PortingPromptOptions {
   skeletonHint?: string;
 }
 
+interface JsonPortResult {
+  code: string;
+}
+interface JsonMemberPortResult {
+  member: string;
+}
+
 export class PortingEngine {
   private static hasDumpedPrompt = false;
   private llm: LLMClient;
@@ -138,6 +145,93 @@ export class PortingEngine {
 
   async portFile(file: SourceFile): Promise<PortedFile> {
     return this.portFileWithOptions(file, {});
+  }
+
+  async portDeclarationWithJson(
+    file: SourceFile,
+    declarationSource: string,
+    options: {
+      passMode?: 'default' | 'skeleton' | 'body';
+      skeletonHint?: string;
+      classNameHint?: string;
+    } = {}
+  ): Promise<string> {
+    const passMode = options.passMode ?? 'default';
+    const prompt = `You are converting one TOP-LEVEL declaration from ${this.sourceLanguage} to ${this.targetLanguage}.
+
+Return ONLY JSON object:
+{"code":"<ported declaration code>"}
+
+Rules:
+- Convert ONLY this declaration.
+- Do NOT include imports/exports/comments outside the declaration.
+- Keep declaration structure valid in target language.
+- Do NOT wrap with markdown.
+${options.classNameHint ? `- This declaration belongs to class ${options.classNameHint}.` : ''}
+${passMode === 'skeleton' ? '- Skeleton pass: keep signatures/shape, minimal valid bodies.' : ''}
+${passMode === 'body' ? '- Body pass: fill implementation, keep declaration/signatures stable.' : ''}
+${options.skeletonHint ? `Skeleton reference:\n${options.skeletonHint}\n` : ''}
+
+Source declaration:
+\`\`\`${this.sourceLanguage}
+${declarationSource}
+\`\`\`
+`;
+
+    const raw = await this.llm.generate(prompt, {
+      temperature: 0,
+      topP: 1,
+      verbose: this.verbose,
+    });
+
+    const parsed = this.parseJsonPortResult(raw);
+    if (parsed?.code?.trim()) {
+      return parsed.code.trim();
+    }
+
+    const fallback = this.extractCode(raw).trim();
+    if (fallback) {
+      return fallback;
+    }
+    throw new Error('Failed to extract JSON/code from declaration conversion response');
+  }
+
+  async portClassMemberWithJson(
+    memberSource: string,
+    className: string,
+    skeletonHint?: string
+  ): Promise<string> {
+    const prompt = `Convert one ${this.sourceLanguage} class member to ${this.targetLanguage}.
+
+Return ONLY JSON:
+{"member":"<ported class member code>"}
+
+Rules:
+- Output only a class member (field/constructor/method/getter/setter), not a full class.
+- Do NOT include imports.
+- Keep behavior and signature.
+- Class name: ${className}
+${skeletonHint ? `Class skeleton reference:\n${skeletonHint}\n` : ''}
+
+Source member:
+\`\`\`${this.sourceLanguage}
+${memberSource}
+\`\`\`
+`;
+
+    const raw = await this.llm.generate(prompt, {
+      temperature: 0,
+      topP: 1,
+      verbose: this.verbose,
+    });
+
+    const parsed = this.parseJsonMemberResult(raw);
+    if (parsed?.member?.trim()) {
+      return parsed.member.trim();
+    }
+
+    const fallback = this.extractCode(raw);
+    return fallback.trim();
   }
 
   async portFileWithOptions(
@@ -245,6 +339,8 @@ export class PortingEngine {
         portedContent = this.mergeDuplicateDartClasses(portedContent);
         portedContent = this.normalizeDartPowUsage(portedContent);
         portedContent = this.normalizeDartCommonFieldIssues(portedContent);
+        portedContent = this.sanitizeDartTypeScriptResiduals(portedContent);
+        portedContent = this.applyDartAnalyzerHeuristicFixes(portedContent);
         let syntaxIssues = this.validateDartSyntaxHeuristics(portedContent);
         if (options.chunked) {
           const deferred = new Set([
@@ -1257,8 +1353,66 @@ ${sourceContent}
       return matches[0][1].trim();
     }
 
-    // If no code blocks, return the response as-is (trimmed)
-    return response.trim();
+    // Fallback: strip common reasoning wrappers and keep likely code body.
+    const cleaned = response
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/^```[\w-]*\s*$/gm, '')
+      .replace(/^```$/gm, '')
+      .trim();
+    if (!cleaned) {
+      return '';
+    }
+
+    const lines = cleaned.split('\n');
+    const start = lines.findIndex(line => {
+      const t = line.trim();
+      return /^import\s+['"]/.test(t)
+        || /^(?:abstract\s+)?class\s+[A-Za-z_]\w*/.test(t)
+        || /^enum\s+[A-Za-z_]\w*/.test(t)
+        || /^typedef\s+/.test(t)
+        || /^mixin\s+/.test(t)
+        || /^extension\s+/.test(t)
+        || /^(?:const|final|var)\s+/.test(t)
+        || /^[A-Za-z_<>\[\]?]+\s+[A-Za-z_]\w*\s*\(/.test(t);
+    });
+
+    return (start >= 0 ? lines.slice(start).join('\n') : cleaned).trim();
+  }
+
+  private parseJsonPortResult(raw: string): JsonPortResult | null {
+    if (!raw || !raw.trim()) return null;
+    const trimmed = raw.trim();
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const body = fenced ? fenced[1].trim() : trimmed;
+    const start = body.indexOf('{');
+    const end = body.lastIndexOf('}');
+    if (start < 0 || end <= start) return null;
+    const jsonText = body.slice(start, end + 1);
+    try {
+      const parsed = JSON.parse(jsonText) as { code?: unknown };
+      if (typeof parsed.code !== 'string') return null;
+      return { code: parsed.code };
+    } catch {
+      return null;
+    }
+  }
+
+  private parseJsonMemberResult(raw: string): JsonMemberPortResult | null {
+    if (!raw || !raw.trim()) return null;
+    const trimmed = raw.trim();
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const body = fenced ? fenced[1].trim() : trimmed;
+    const start = body.indexOf('{');
+    const end = body.lastIndexOf('}');
+    if (start < 0 || end <= start) return null;
+    const jsonText = body.slice(start, end + 1);
+    try {
+      const parsed = JSON.parse(jsonText) as { member?: unknown };
+      if (typeof parsed.member !== 'string') return null;
+      return { member: parsed.member };
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1549,6 +1703,66 @@ ${sourceContent}
     return Array.from(new Set(issues));
   }
 
+  applyContractStubFallback(
+    content: string,
+    sourcePath: string,
+    issues?: string[]
+  ): { content: string; injected: string[] } {
+    if (this.targetLanguage !== 'dart') {
+      return { content, injected: [] };
+    }
+
+    const contractIssues = (issues ?? this.validateDartContractHeuristics(content, sourcePath))
+      .filter(issue => /^[A-Za-z_]\w*\.[A-Za-z_]\w* missing$/.test(issue));
+    if (contractIssues.length === 0) {
+      return { content, injected: [] };
+    }
+
+    const byClass = new Map<string, Set<string>>();
+    for (const issue of contractIssues) {
+      const m = issue.match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*) missing$/);
+      if (!m) continue;
+      const className = m[1];
+      const method = m[2];
+      if (!byClass.has(className)) {
+        byClass.set(className, new Set());
+      }
+      byClass.get(className)!.add(method);
+    }
+
+    const ranges: Array<{ start: number; end: number; insert: string; injected: string[] }> = [];
+    for (const [className, methods] of byClass.entries()) {
+      const classRange = this.findClassRange(content, className);
+      if (!classRange) continue;
+      const classBody = content.slice(classRange.openBrace + 1, classRange.closeBrace);
+      const missing = Array.from(methods).filter(method => !new RegExp(`\\b${this.escapeRegex(method)}\\s*\\(`).test(classBody));
+      if (missing.length === 0) continue;
+      const stubBlock = missing
+        .map(method => this.buildContractStubMethod(method))
+        .join('\n\n');
+      ranges.push({
+        start: classRange.closeBrace,
+        end: classRange.closeBrace,
+        insert: `\n\n${stubBlock}\n`,
+        injected: missing.map(method => `${className}.${method}`),
+      });
+    }
+
+    if (ranges.length === 0) {
+      return { content, injected: [] };
+    }
+
+    ranges.sort((a, b) => b.start - a.start);
+    let updated = content;
+    const injected: string[] = [];
+    for (const range of ranges) {
+      updated = `${updated.slice(0, range.start)}${range.insert}${updated.slice(range.end)}`;
+      injected.push(...range.injected);
+    }
+
+    return { content: updated, injected };
+  }
+
   private rebuildCoreSymbolTable(): void {
     this.coreSymbolTable.clear();
     if (!this.apiSnapshot) return;
@@ -1625,6 +1839,24 @@ ${sourceContent}
     return content.slice(openBrace + 1, closeBrace);
   }
 
+  private findClassRange(
+    content: string,
+    className: string
+  ): { start: number; openBrace: number; closeBrace: number } | null {
+    const classRegex = new RegExp(`\\b(?:abstract\\s+)?class\\s+${this.escapeRegex(className)}\\b[^\\{]*\\{`, 'g');
+    const match = classRegex.exec(content);
+    if (!match || match.index === undefined) return null;
+    const openBrace = content.indexOf('{', match.index);
+    if (openBrace < 0) return null;
+    const closeBrace = this.findMatchingBrace(content, openBrace);
+    if (closeBrace < 0) return null;
+    return { start: match.index, openBrace, closeBrace };
+  }
+
+  private buildContractStubMethod(methodName: string): string {
+    return `  dynamic ${methodName}([dynamic arg0, dynamic arg1, dynamic arg2, dynamic arg3]) {\n    return null;\n  }`;
+  }
+
   finalizeImportsForTarget(content: string, currentFilePath: string): string {
     let updated = content;
     if (this.targetLanguage === 'dart') {
@@ -1648,6 +1880,8 @@ ${sourceContent}
     updated = this.mergeDuplicateDartClasses(updated);
     updated = this.normalizeDartPowUsage(updated);
     updated = this.normalizeDartCommonFieldIssues(updated);
+    updated = this.sanitizeDartTypeScriptResiduals(updated);
+    updated = this.applyDartAnalyzerHeuristicFixes(updated);
     updated = this.narrowDartImportsByUsage(updated);
     updated = this.ensureDartRequiredImports(updated, file);
     if (!isEntryFile) {
@@ -1732,6 +1966,55 @@ ${sourceContent}
         return `late ${typeName.trim()} ${fieldName};`;
       });
     }
+
+    return updated;
+  }
+
+  private sanitizeDartTypeScriptResiduals(content: string): string {
+    let updated = content;
+    // Remove TS-style visibility modifiers that can leak into Dart output.
+    updated = updated.replace(
+      /^(\s*)(public|protected|private)\s+([A-Za-z_]\w*\s*\()/gm,
+      (_m, indent: string, _kw: string, rest: string) => `${indent}${rest}`
+    );
+    // Strip explicit `readonly` keyword if leaked.
+    updated = updated.replace(/^(\s*)readonly\s+/gm, '$1');
+    // Normalize accidental `export default` remnants.
+    updated = updated.replace(/\bexport\s+default\b/g, '');
+    return updated;
+  }
+
+  private applyDartAnalyzerHeuristicFixes(content: string): string {
+    let updated = content;
+
+    // Fix frequent analyzer issue: non-const initializer under `const`.
+    updated = updated.replace(
+      /^(\s*)const(\s+[A-Za-z_<>, ?]+\s+[A-Za-z_]\w*\s*=\s*)([^;]+);$/gm,
+      (_m, indent: string, lhs: string, rhs: string) => {
+        const expr = rhs.trim();
+        const likelyNonConst =
+          /\bnew\s+/.test(expr) ||
+          /\b[A-Za-z_]\w*\s*\(/.test(expr) ||
+          /\b[A-Za-z_]\w*\.[A-Za-z_]\w*/.test(expr);
+        if (likelyNonConst && !expr.startsWith('const ')) {
+          return `${indent}final${lhs}${expr};`;
+        }
+        return `${indent}const${lhs}${expr};`;
+      }
+    );
+
+    // Fix frequent analyzer issue: non-nullable instance fields without initializer.
+    updated = updated.replace(
+      /^(\s*)(?!late\b)(?!static\b)(?!const\b)(?!external\b)(?!factory\b)(?!abstract\b)(final\s+)?([A-Za-z_]\w*(?:<[^>]+>)?\??)\s+([A-Za-z_]\w*)\s*;\s*$/gm,
+      (_m, indent: string, finalKw: string | undefined, typeName: string, fieldName: string) => {
+        // Preserve nullable declarations as-is.
+        if (typeName.trim().endsWith('?')) {
+          return `${indent}${finalKw ?? ''}${typeName} ${fieldName};`;
+        }
+        // Convert `final T x;` or `T x;` to `late T x;`
+        return `${indent}late ${typeName} ${fieldName};`;
+      }
+    );
 
     return updated;
   }

@@ -62,18 +62,35 @@ export class OpenAICompatibleClient implements LLMClient {
     const opts = { ...this.defaultOptions, ...options };
     const startedAt = Date.now();
     const verbose = options?.verbose === true;
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({
-        model: this.model,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: opts.temperature,
-        top_p: opts.topP,
-        max_tokens: opts.maxTokens,
-        stream: false,
-      }),
-    });
+    const timeoutMs = opts.timeoutMs ?? 0;
+    const controller = timeoutMs > 0 ? new AbortController() : undefined;
+    const timeoutHandle = timeoutMs > 0
+      ? setTimeout(() => controller?.abort(), timeoutMs)
+      : undefined;
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: this.headers(),
+        signal: controller?.signal,
+        body: JSON.stringify({
+          model: this.model,
+          messages: [{ role: 'user', content: prompt }],
+          temperature: opts.temperature,
+          top_p: opts.topP,
+          max_tokens: opts.maxTokens,
+          stream: false,
+        }),
+      });
+    } catch (error) {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (timeoutMs > 0) {
+        throw new Error(`LLM request timed out after ${timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
 
     if (!response.ok) {
       const error = await response.text();
