@@ -2,7 +2,7 @@ import { OllamaClient } from './ollama.js';
 import { OpenAICompatibleClient } from './openai-compatible.js';
 import type { GenerateOptions, LLMClient } from './types.js';
 
-export type LLMProvider = 'ollama' | 'openai';
+export type LLMProvider = 'ollama' | 'openai' | 'mlx' | 'lmstudio';
 
 export interface LLMClientConfig {
   provider: LLMProvider;
@@ -13,7 +13,7 @@ export interface LLMClientConfig {
 }
 
 export function createLLMClient(config: LLMClientConfig): LLMClient {
-  if (config.provider === 'openai') {
+  if (config.provider === 'openai' || config.provider === 'mlx' || config.provider === 'lmstudio') {
     return new OpenAICompatibleClient(
       config.baseUrl,
       config.model,

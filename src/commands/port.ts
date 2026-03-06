@@ -83,11 +83,24 @@ function parseTestMode(value: string | undefined): TestMode {
 }
 
 function parseProvider(value: string | undefined): LLMProvider {
-  const provider = (value ?? 'ollama').toLowerCase();
-  if (provider === 'ollama' || provider === 'openai') {
+  const provider = (value ?? 'lmstudio').toLowerCase();
+  if (provider === 'ollama' || provider === 'openai' || provider === 'mlx' || provider === 'lmstudio') {
     return provider;
   }
-  throw new Error(`Invalid --provider: ${value}. Use one of: ollama, openai.`);
+  throw new Error(`Invalid --provider: ${value}. Use one of: ollama, openai, mlx, lmstudio.`);
+}
+
+function getDefaultBaseUrl(provider: LLMProvider, ollamaUrl: string): string {
+  if (provider === 'ollama') {
+    return ollamaUrl;
+  }
+  if (provider === 'mlx') {
+    return 'http://127.0.0.1:9090/v1';
+  }
+  if (provider === 'lmstudio') {
+    return 'http://127.0.0.1:1234/v1';
+  }
+  return 'http://127.0.0.1:8000/v1';
 }
 
 function selectFilesByTestMode<T extends { type: string }>(files: T[], mode: TestMode): T[] {
@@ -271,10 +284,12 @@ export async function portProject(
 
   try {
     const provider = parseProvider(options.provider);
-    const baseUrl = options.baseUrl ?? options.ollamaUrl;
+    const baseUrl = options.baseUrl ?? getDefaultBaseUrl(provider, options.ollamaUrl);
     const reviewerProvider = parseProvider(options.reviewerProvider ?? options.provider);
-    const reviewerBaseUrl = options.reviewerBaseUrl ?? options.baseUrl ?? options.ollamaUrl;
-    const reviewerModel = options.reviewerModel?.trim() || 'deepseek-r1:70b';
+    const reviewerBaseUrl = options.reviewerBaseUrl
+      ?? options.baseUrl
+      ?? getDefaultBaseUrl(reviewerProvider, options.ollamaUrl);
+    const reviewerModel = options.reviewerModel?.trim() || 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit';
     const reviewerApiKey = options.reviewerApiKey ?? options.apiKey;
     process.env.MORPHIE_REVIEWER_MODEL = reviewerModel;
     process.env.MORPHIE_REVIEWER_PROVIDER = reviewerProvider;
@@ -496,6 +511,7 @@ export async function portProject(
     }, 0);
     if (resumableCount > 0) {
       console.log(chalk.gray(`Resuming session: ${resumableCount} files will be skipped (already completed).`));
+      processed = resumableCount;
     }
 
     const tasks = files.map(async file => {

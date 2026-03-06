@@ -613,6 +613,7 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         }, 0);
         if (resumableCount > 0) {
             this.log(`  Resuming session: ${resumableCount} files will be skipped (already completed).`);
+            processed = resumableCount;
         }
 
         const tasks = filesToPort.map(async file => {
@@ -747,6 +748,33 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
             this.log(`  Skipped ${skippedCount} unchanged files from previous session.`);
         }
 
+        const recovered = await this.recoverFailedFilesWithPostProcess(
+            task,
+            orderedBaseFiles,
+            engine,
+            errors,
+            completed,
+            fileHashes
+        );
+        if (recovered > 0) {
+            this.log(`  Recovered ${recovered} failed files via post-process.`);
+        }
+
+        const rePorted = await this.recoverFailedFilesByRePorting(
+            task,
+            orderedBaseFiles,
+            engine,
+            filePorter,
+            errors,
+            completed,
+            fileHashes,
+            apiSnapshot,
+            portedFiles
+        );
+        if (rePorted > 0) {
+            this.log(`  Recovered ${rePorted} failed files via recovery re-port.`);
+        }
+
         this.lastPortedFiles = portedFiles;
         if (portedFiles.some(file => file.metadata?.importIssues?.length)) {
             this.lastImportIssueFiles = portedFiles
@@ -760,6 +788,189 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
             files: portedFiles,
             errors,
         };
+    }
+
+    private async recoverFailedFilesWithPostProcess(
+        task: PortingTask,
+        sourceFiles: SourceFile[],
+        engine: any,
+        errors: PortingError[],
+        completed: Set<string>,
+        fileHashes: Record<string, string>
+    ): Promise<number> {
+        if (task.targetLanguage !== 'dart' || task.dryRun) {
+            return 0;
+        }
+
+        const failedSourcePaths = Array.from(
+            new Set(
+                errors
+                    .map(err => err.file)
+                    .filter((file): file is string => Boolean(file))
+            )
+        );
+        if (failedSourcePaths.length === 0) {
+            return 0;
+        }
+
+        let recovered = 0;
+        for (const sourcePath of failedSourcePaths) {
+            const sourceFile = sourceFiles.find(file => file.relativePath === sourcePath);
+            if (!sourceFile) continue;
+
+            const targetPath = `${task.targetPath}/${engine.getTargetPath(sourcePath)}`;
+            if (!(await this.fs.fileExists(targetPath))) {
+                continue;
+            }
+
+            try {
+                const raw = await this.fs.readFile(targetPath);
+                let normalized = engine.finalizeDartChunkedContent(raw, sourceFile);
+                let issues = engine.validateFinalChunkedOutput(normalized, sourcePath) as string[];
+                if (issues.some(issue => issue.endsWith(' missing'))) {
+                    const fallback = engine.applyContractStubFallback(normalized, sourcePath, issues) as {
+                        content: string;
+                        injected: string[];
+                    };
+                    if (fallback.injected.length > 0) {
+                        normalized = engine.finalizeDartChunkedContent(fallback.content, sourceFile);
+                        issues = engine.validateFinalChunkedOutput(normalized, sourcePath) as string[];
+                    }
+                }
+
+                if (issues.length > 0) {
+                    continue;
+                }
+
+                await this.fs.writeFile(targetPath, normalized);
+                recovered += 1;
+
+                const contentHash = crypto.createHash('sha256').update(sourceFile.content).digest('hex');
+                completed.add(sourceFile.relativePath);
+                fileHashes[sourceFile.relativePath] = contentHash;
+
+                for (let i = errors.length - 1; i >= 0; i -= 1) {
+                    if (errors[i].file === sourcePath) {
+                        errors.splice(i, 1);
+                    }
+                }
+                if (this.session) {
+                    this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== sourcePath);
+                    this.session.completedFiles = Array.from(completed);
+                    this.session.fileHashes = fileHashes;
+                }
+            } catch {
+                // Best-effort recovery; ignore and keep original error.
+            }
+        }
+
+        if (recovered > 0 && this.session && this.sessionPath) {
+            await this.sessionManager.save(this.sessionPath, this.session);
+        }
+
+        return recovered;
+    }
+
+    private async recoverFailedFilesByRePorting(
+        task: PortingTask,
+        sourceFiles: SourceFile[],
+        engine: any,
+        filePorter: FilePorter,
+        errors: PortingError[],
+        completed: Set<string>,
+        fileHashes: Record<string, string>,
+        apiSnapshot: string,
+        portedFiles: PortedFile[]
+    ): Promise<number> {
+        if (task.dryRun) {
+            return 0;
+        }
+
+        const failedSources = Array.from(
+            new Set(
+                errors
+                    .map(err => err.file)
+                    .filter((f): f is string => Boolean(f))
+                    .filter(f => sourceFiles.some(sf => sf.relativePath === f))
+            )
+        );
+
+        if (failedSources.length === 0) {
+            return 0;
+        }
+
+        let recovered = 0;
+        for (const sourcePath of failedSources) {
+            const sourceFile = sourceFiles.find(file => file.relativePath === sourcePath);
+            if (!sourceFile) continue;
+            if (completed.has(sourceFile.relativePath)) {
+                continue;
+            }
+            const targetPath = `${task.targetPath}/${engine.getTargetPath(sourcePath)}`;
+            const targetExists = await this.fs.fileExists(targetPath);
+            if (targetExists) {
+                try {
+                    const existing = await this.fs.readFile(targetPath);
+                    // Recovery re-port pass is only for hard-fail files with no usable output.
+                    if (existing.trim().length > 0) {
+                        continue;
+                    }
+                } catch {
+                    // If read fails, still attempt recovery re-port.
+                }
+            }
+
+            this.log(`  [Recovery] Re-porting failed file: ${sourcePath}`);
+            try {
+                const result = await filePorter.execute({
+                    file: sourceFile,
+                    sourceLanguage: task.sourceLanguage,
+                    targetLanguage: task.targetLanguage,
+                    projectName: task.targetPath.split('/').pop() || 'project',
+                    targetPath: task.targetPath,
+                    allFiles: sourceFiles,
+                    apiSnapshot,
+                    verbose: this.verbose,
+                });
+
+                if (!result.success || !result.output?.file) {
+                    continue;
+                }
+
+                const ported = result.output.file;
+                await this.fs.writeFile(`${task.targetPath}/${ported.targetPath}`, ported.content);
+                portedFiles.push({
+                    originalPath: ported.originalPath,
+                    targetPath: ported.targetPath,
+                    content: ported.content,
+                    sourceLanguage: task.sourceLanguage,
+                    targetLanguage: task.targetLanguage,
+                    metadata: ported.metadata,
+                });
+                recovered += 1;
+
+                const contentHash = crypto.createHash('sha256').update(sourceFile.content).digest('hex');
+                completed.add(sourceFile.relativePath);
+                fileHashes[sourceFile.relativePath] = contentHash;
+                for (let i = errors.length - 1; i >= 0; i -= 1) {
+                    if (errors[i].file === sourcePath) {
+                        errors.splice(i, 1);
+                    }
+                }
+                if (this.session) {
+                    this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== sourcePath);
+                    this.session.completedFiles = Array.from(completed);
+                    this.session.fileHashes = fileHashes;
+                }
+            } catch {
+                // keep original failure
+            }
+        }
+
+        if (recovered > 0 && this.session && this.sessionPath) {
+            await this.sessionManager.save(this.sessionPath, this.session);
+        }
+        return recovered;
     }
 
     private selectFilesByTestMode<T extends { type: string }>(files: T[], mode: TestMode): T[] {

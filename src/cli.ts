@@ -19,12 +19,16 @@ program
   .argument('<target>', 'Target output directory')
   .requiredOption('-f, --from <language>', 'Source language (e.g., python, javascript, go)')
   .requiredOption('-t, --to <language>', 'Target language (e.g., rust, typescript, java)')
-  .option('-m, --model <model>', 'LLM model to use (default: qwen3-coder:30b-a3b-q8_0)', 'qwen3-coder:30b-a3b-q8_0')
-  .option('--provider <provider>', 'LLM provider: ollama|openai', 'ollama')
+  .option(
+    '-m, --model <model>',
+    'LLM model to use (default: mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit)',
+    'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit'
+  )
+  .option('--provider <provider>', 'LLM provider: ollama|openai|mlx|lmstudio', 'lmstudio')
   .option('--base-url <url>', 'LLM API base URL (overrides --ollama-url if set)')
   .option('--api-key <key>', 'API key for OpenAI-compatible providers')
-  .option('--reviewer-model <model>', 'Reviewer model for failure-retry stage (default: deepseek-r1:70b)')
-  .option('--reviewer-provider <provider>', 'Reviewer provider: ollama|openai (defaults to --provider)')
+  .option('--reviewer-model <model>', 'Reviewer model for failure-retry stage (default: mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit)')
+  .option('--reviewer-provider <provider>', 'Reviewer provider: ollama|openai|mlx|lmstudio (defaults to --provider)')
   .option('--reviewer-base-url <url>', 'Reviewer API base URL (defaults to --base-url/--ollama-url)')
   .option('--reviewer-api-key <key>', 'API key for reviewer provider (defaults to --api-key)')
   .option('--ollama-url <url>', 'Ollama API URL', 'http://localhost:11434')
@@ -61,7 +65,7 @@ program
 program
   .command('models')
   .description('List available LLM models from provider endpoint')
-  .option('--provider <provider>', 'LLM provider: ollama|openai', 'ollama')
+  .option('--provider <provider>', 'LLM provider: ollama|openai|mlx|lmstudio', 'lmstudio')
   .option('--base-url <url>', 'LLM API base URL (overrides --ollama-url if set)')
   .option('--api-key <key>', 'API key for OpenAI-compatible providers')
   .option('--ollama-url <url>', 'Ollama API URL', 'http://localhost:11434')

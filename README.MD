@@ -46,7 +46,7 @@ morphie port <source-dir> <target-dir> -f <from-lang> -t <to-lang>
 morphie port ./my-ts-project ./my-dart-project -f typescript -t dart
 
 # With specific model
-morphie port ./src ./output -f typescript -t dart -m codellama:7b
+morphie port ./src ./output -f typescript -t dart -m mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit
 
 # Dry run (analyze only)
 morphie port ./src ./output -f typescript -t dart --dry-run
@@ -78,7 +78,7 @@ morphie models
 |--------|-------------|---------|
 | `-f, --from <lang>` | Source language | Required |
 | `-t, --to <lang>` | Target language | Required |
-| `-m, --model <model>` | Ollama model | `codellama` |
+| `-m, --model <model>` | LLM model | `mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit` |
 | `--ollama-url <url>` | Ollama API URL | `http://localhost:11434` |
 | `--dry-run` | Analyze without porting | `false` |
 | `-v, --verbose` | Verbose output | `false` |

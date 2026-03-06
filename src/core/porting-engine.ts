@@ -154,6 +154,11 @@ export class PortingEngine {
       passMode?: 'default' | 'skeleton' | 'body';
       skeletonHint?: string;
       classNameHint?: string;
+      debug?: {
+        filePath?: string;
+        unitIndex?: number;
+        totalUnits?: number;
+      };
     } = {}
   ): Promise<string> {
     const passMode = options.passMode ?? 'default';
@@ -177,11 +182,24 @@ Source declaration:
 ${declarationSource}
 \`\`\`
 `;
+    if (this.verbose) {
+      const chunkLabel = options.debug?.unitIndex !== undefined && options.debug?.totalUnits !== undefined
+        ? ` chunk=${options.debug.unitIndex + 1}/${options.debug.totalUnits}`
+        : '';
+      const sourceLength = declarationSource.length;
+      const promptWithoutSource = Math.max(0, prompt.length - sourceLength);
+      console.log(
+        `[Porting Debug] Prompt stats (${options.debug?.filePath ?? file.relativePath})` +
+        ` attempt=1${chunkLabel} mode=json-${passMode} total=${prompt.length}` +
+        ` source=${sourceLength} importContext=0 promptWithoutSource=${promptWithoutSource}`
+      );
+    }
 
     const raw = await this.llm.generate(prompt, {
       temperature: 0,
       topP: 1,
       verbose: this.verbose,
+      timeoutMs: this.getTimeoutForCurrentModel(),
     });
 
     const parsed = this.parseJsonPortResult(raw);
@@ -199,7 +217,12 @@ ${declarationSource}
   async portClassMemberWithJson(
     memberSource: string,
     className: string,
-    skeletonHint?: string
+    skeletonHint?: string,
+    debug?: {
+      filePath?: string;
+      memberIndex?: number;
+      totalMembers?: number;
+    }
   ): Promise<string> {
     const prompt = `Convert one ${this.sourceLanguage} class member to ${this.targetLanguage}.
 
@@ -218,11 +241,24 @@ Source member:
 ${memberSource}
 \`\`\`
 `;
+    if (this.verbose) {
+      const chunkLabel = debug?.memberIndex !== undefined && debug?.totalMembers !== undefined
+        ? ` chunk=${debug.memberIndex + 1}/${debug.totalMembers}`
+        : '';
+      const sourceLength = memberSource.length;
+      const promptWithoutSource = Math.max(0, prompt.length - sourceLength);
+      console.log(
+        `[Porting Debug] Prompt stats (${debug?.filePath ?? className})` +
+        ` attempt=1${chunkLabel} mode=json-member total=${prompt.length}` +
+        ` source=${sourceLength} importContext=0 promptWithoutSource=${promptWithoutSource}`
+      );
+    }
 
     const raw = await this.llm.generate(prompt, {
       temperature: 0,
       topP: 1,
       verbose: this.verbose,
+      timeoutMs: this.getTimeoutForCurrentModel(),
     });
 
     const parsed = this.parseJsonMemberResult(raw);
@@ -301,6 +337,7 @@ ${memberSource}
         temperature: 0,
         topP: 1,
         verbose: this.verbose,
+        timeoutMs: this.getTimeoutForCurrentModel(),
       });
 
       if (!response || response.trim() === '') {
@@ -335,8 +372,13 @@ ${memberSource}
       // Defer invalid-import cleanup to a final post-processing pass
 
       if (this.targetLanguage === 'dart') {
+        const isFinalChunk = options.chunked
+          ? (options.chunkIndex ?? 0) >= ((options.totalChunks ?? 1) - 1)
+          : true;
         portedContent = this.sanitizeDartModuleSyntax(portedContent);
+        portedContent = this.repairDartDelimiterBalance(portedContent, !options.chunked || isFinalChunk);
         portedContent = this.mergeDuplicateDartClasses(portedContent);
+        portedContent = this.dedupeTopLevelDeclarations(portedContent);
         portedContent = this.normalizeDartPowUsage(portedContent);
         portedContent = this.normalizeDartCommonFieldIssues(portedContent);
         portedContent = this.sanitizeDartTypeScriptResiduals(portedContent);
@@ -1415,6 +1457,23 @@ ${sourceContent}
     }
   }
 
+  private getTimeoutForCurrentModel(): number | undefined {
+    const model = this.llm.getModel();
+    const reviewerModel = (process.env.MORPHIE_REVIEWER_MODEL ?? '').trim();
+    if (reviewerModel && model === reviewerModel) {
+      const reviewerTimeout = Number(process.env.MORPHIE_REVIEWER_TIMEOUT_MS ?? '150000');
+      if (Number.isFinite(reviewerTimeout) && reviewerTimeout > 0) {
+        return Math.floor(reviewerTimeout);
+      }
+      return 150000;
+    }
+    const workerTimeout = Number(process.env.MORPHIE_WORKER_TIMEOUT_MS ?? '0');
+    if (Number.isFinite(workerTimeout) && workerTimeout > 0) {
+      return Math.floor(workerTimeout);
+    }
+    return undefined;
+  }
+
   /**
    * Removes self-import statements from the ported code
    * Self-imports are import statements that reference the current file itself
@@ -1653,7 +1712,7 @@ ${sourceContent}
     issues.push(...this.findDuplicateTopLevelDeclarations(content));
     const semanticTarget = this.stripCommentsAndStringsForBalance(content);
 
-    if (/\bpow\s*\(/.test(semanticTarget) && !/^\s*import\s+['"]dart:math['"]/m.test(content)) {
+    if (/(^|[^.\w])pow\s*\(/.test(semanticTarget) && !/^\s*import\s+['"]dart:math['"]/m.test(content)) {
       issues.push('pow() used without dart:math import');
     }
 
@@ -1861,6 +1920,8 @@ ${sourceContent}
     let updated = content;
     if (this.targetLanguage === 'dart') {
       updated = this.sanitizeDartModuleSyntax(updated);
+      updated = this.repairDartDelimiterBalance(updated, true);
+      updated = this.dedupeTopLevelDeclarations(updated);
       updated = this.normalizeDartPowUsage(updated);
       updated = this.normalizeDartCommonFieldIssues(updated);
       updated = this.narrowDartImportsByUsage(updated);
@@ -1877,7 +1938,10 @@ ${sourceContent}
     const isEntryFile = this.isEntryFilePath(file.relativePath, targetPath);
 
     let updated = this.sanitizeDartModuleSyntax(content);
+    updated = this.repairDartDelimiterBalance(updated, true);
     updated = this.mergeDuplicateDartClasses(updated);
+    updated = this.dedupeTopLevelDeclarations(updated);
+    updated = this.repairDartDelimiterBalance(updated, true);
     updated = this.normalizeDartPowUsage(updated);
     updated = this.normalizeDartCommonFieldIssues(updated);
     updated = this.sanitizeDartTypeScriptResiduals(updated);
@@ -2123,6 +2187,152 @@ ${sourceContent}
     let updated = content;
     for (const range of replacementRanges) {
       updated = `${updated.slice(0, range.start)}${range.replacement}${updated.slice(range.end)}`;
+    }
+
+    return updated.replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  private dedupeTopLevelDeclarations(content: string): string {
+    type Range = { start: number; end: number };
+    const removal: Range[] = [];
+    const seen = new Set<string>();
+    const declRegex = /^\s*(?:abstract\s+)?(class|enum|mixin|typedef)\s+([A-Za-z_]\w*)\b/gm;
+    let match: RegExpExecArray | null;
+
+    while ((match = declRegex.exec(content)) !== null) {
+      const kind = match[1];
+      const name = match[2];
+      let start = match.index;
+      let end = -1;
+
+      if (kind === 'typedef') {
+        const semi = content.indexOf(';', declRegex.lastIndex);
+        if (semi >= 0) {
+          end = semi + 1;
+        }
+      } else {
+        const openBrace = content.indexOf('{', declRegex.lastIndex - 1);
+        if (openBrace >= 0) {
+          const closeBrace = this.findMatchingBrace(content, openBrace);
+          if (closeBrace >= 0) {
+            end = closeBrace + 1;
+            declRegex.lastIndex = end;
+          }
+        }
+      }
+
+      if (end <= start) {
+        continue;
+      }
+      if (seen.has(name)) {
+        removal.push({ start, end });
+      } else {
+        seen.add(name);
+      }
+    }
+
+    if (removal.length === 0) {
+      return content;
+    }
+
+    removal.sort((a, b) => b.start - a.start);
+    let updated = content;
+    for (const range of removal) {
+      updated = `${updated.slice(0, range.start)}\n${updated.slice(range.end)}`;
+    }
+    return updated.replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  private repairDartDelimiterBalance(content: string, appendMissingClosers: boolean): string {
+    if (!content.trim()) {
+      return content;
+    }
+
+    const removeIndexes = new Set<number>();
+    const openerToCloser: Record<string, string> = { '{': '}', '[': ']', '(': ')' };
+    const closerToOpener: Record<string, string> = { '}': '{', ']': '[', ')': '(' };
+    const stack: Array<{ char: string; index: number }> = [];
+    let i = 0;
+    let inLineComment = false;
+    let inBlockComment = false;
+    let inString: "'" | '"' | '`' | null = null;
+
+    while (i < content.length) {
+      const ch = content[i];
+      const next = content[i + 1];
+
+      if (inLineComment) {
+        if (ch === '\n') inLineComment = false;
+        i += 1;
+        continue;
+      }
+      if (inBlockComment) {
+        if (ch === '*' && next === '/') {
+          inBlockComment = false;
+          i += 2;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      if (inString) {
+        if (ch === '\\') {
+          i += 2;
+          continue;
+        }
+        if (ch === inString) {
+          inString = null;
+        }
+        i += 1;
+        continue;
+      }
+
+      if (ch === '/' && next === '/') {
+        inLineComment = true;
+        i += 2;
+        continue;
+      }
+      if (ch === '/' && next === '*') {
+        inBlockComment = true;
+        i += 2;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        inString = ch as "'" | '"' | '`';
+        i += 1;
+        continue;
+      }
+
+      if (ch in openerToCloser) {
+        stack.push({ char: ch, index: i });
+        i += 1;
+        continue;
+      }
+      if (ch in closerToOpener) {
+        const expectedOpen = closerToOpener[ch];
+        if (stack.length > 0 && stack[stack.length - 1].char === expectedOpen) {
+          stack.pop();
+        } else {
+          removeIndexes.add(i);
+        }
+      }
+      i += 1;
+    }
+
+    let updated = content
+      .split('')
+      .filter((_char, idx) => !removeIndexes.has(idx))
+      .join('');
+
+    if (appendMissingClosers && stack.length > 0) {
+      const suffix = stack
+        .slice()
+        .reverse()
+        .map(item => openerToCloser[item.char] ?? '')
+        .join('');
+      if (suffix.length > 0) {
+        updated = `${updated}\n${suffix}`;
+      }
     }
 
     return updated.replace(/\n{3,}/g, '\n\n').trim();

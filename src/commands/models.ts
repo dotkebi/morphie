@@ -10,18 +10,31 @@ interface ModelsOptions {
 }
 
 function parseProvider(value: string | undefined): LLMProvider {
-  const provider = (value ?? 'ollama').toLowerCase();
-  if (provider === 'ollama' || provider === 'openai') {
+  const provider = (value ?? 'lmstudio').toLowerCase();
+  if (provider === 'ollama' || provider === 'openai' || provider === 'mlx' || provider === 'lmstudio') {
     return provider;
   }
-  throw new Error(`Invalid --provider: ${value}. Use one of: ollama, openai.`);
+  throw new Error(`Invalid --provider: ${value}. Use one of: ollama, openai, mlx, lmstudio.`);
+}
+
+function getDefaultBaseUrl(provider: LLMProvider, ollamaUrl: string): string {
+  if (provider === 'ollama') {
+    return ollamaUrl;
+  }
+  if (provider === 'mlx') {
+    return 'http://127.0.0.1:9090/v1';
+  }
+  if (provider === 'lmstudio') {
+    return 'http://127.0.0.1:1234/v1';
+  }
+  return 'http://127.0.0.1:8000/v1';
 }
 
 export async function listModels(options: ModelsOptions): Promise<void> {
   console.log(chalk.blue.bold('\n🍴 Morphie - Available Models\n'));
 
   const provider = parseProvider(options.provider);
-  const baseUrl = options.baseUrl ?? options.ollamaUrl;
+  const baseUrl = options.baseUrl ?? getDefaultBaseUrl(provider, options.ollamaUrl);
   const spinner = ora(`Fetching models from ${provider}...`).start();
 
   try {
