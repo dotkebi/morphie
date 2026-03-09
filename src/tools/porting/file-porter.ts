@@ -39,11 +39,11 @@ export class FilePorter extends BaseTool {
             maxRetries: options.maxRetries ?? 2,
             includeComments: options.includeComments ?? true,
         };
-        const maxPromptTokens = this.readPositiveIntEnv('MORPHIE_MAX_PROMPT_TOKENS', 1800);
+        const maxPromptTokens = this.readPositiveIntEnv('MORPHIE_MAX_PROMPT_TOKENS', 24000);
         this.maxPromptTokens = maxPromptTokens;
         this.reducedPromptTokens = Math.max(1000, Math.floor(maxPromptTokens * 0.7));
         this.minimalPromptTokens = Math.max(1200, Math.floor(maxPromptTokens * 0.85));
-        const defaultDeclPromptChars = Math.max(2000, Math.min(8000, maxPromptTokens * 3));
+        const defaultDeclPromptChars = Math.max(2000, Math.min(72000, maxPromptTokens * 3));
         this.maxDeclarationPromptChars = this.readPositiveIntEnv('MORPHIE_MAX_DECL_PROMPT_CHARS', defaultDeclPromptChars);
     }
 
@@ -303,6 +303,10 @@ export class FilePorter extends BaseTool {
         const lower = content.toLowerCase();
         if (lower.includes(' class ') || lower.includes('\nclass ')) return false;
         if (lower.includes(' function ') || lower.includes('\nfunction ')) return false;
+        // Files that are ONLY enums (no const data) should go through LLM for proper naming
+        const hasConstData = /\bconst\s+[A-Za-z_]\w*\s*[=:]/.test(content);
+        const hasEnum = /\benum\s+[A-Za-z_]\w*/.test(content);
+        if (hasEnum && !hasConstData) return false;
 
         const controlCount = (content.match(/\b(if|for|while|switch|try|catch)\b/g) ?? []).length;
         const exportConstCount = (content.match(/\bexport\s+const\b/g) ?? []).length;
@@ -354,6 +358,21 @@ export class FilePorter extends BaseTool {
 
             const emitted: string[] = [];
             for (const statement of sourceFile.statements) {
+                // Handle enum declarations — convert to Dart enum
+                if (ts.isEnumDeclaration(statement)) {
+                    const hasExport = statement.modifiers?.some((modifier: any) => modifier.kind === ts.SyntaxKind.ExportKeyword);
+                    if (!hasExport && hasAnyExport) continue;
+                    const enumName = statement.name.text;
+                    const members = statement.members.map((m: any) => {
+                        const memberName = ts.isIdentifier(m.name) ? m.name.text : m.name.getText();
+                        // Convert to camelCase for Dart enum convention
+                        const dartName = memberName.charAt(0).toLowerCase() + memberName.slice(1);
+                        return `  ${dartName}`;
+                    });
+                    emitted.push(`enum ${enumName} {\n${members.join(',\n')},\n}`);
+                    continue;
+                }
+
                 if (ts.isVariableStatement(statement)) {
                     const hasExport = statement.modifiers?.some((modifier: any) => modifier.kind === ts.SyntaxKind.ExportKeyword);
                     if (!hasExport && hasAnyExport) continue;
@@ -365,7 +384,9 @@ export class FilePorter extends BaseTool {
                             if (!converted) continue;
                             const withType = converted.kind === 'map'
                                 ? `<String, dynamic>${converted.text}`
-                                : `<dynamic>${converted.text}`;
+                                : converted.kind === 'list'
+                                    ? `<dynamic>${converted.text}`
+                                    : converted.text;
                             emitted.push(`const ${name} = ${withType};`);
                         }
                     }
@@ -424,6 +445,21 @@ export class FilePorter extends BaseTool {
                 return null;
             }
             const statement = sourceFile.statements[0];
+            // Preserve any leading // comment lines (e.g. file header comments)
+            const leadingComments = (declarationSource.match(/^(\/\/[^\n]*\n)*/)?.[0] ?? '').trimEnd();
+
+            // Handle standalone enum declarations deterministically
+            if (ts.isEnumDeclaration(statement)) {
+                const enumName = statement.name.text;
+                const members = statement.members.map((m: any) => {
+                    const memberName = ts.isIdentifier(m.name) ? m.name.text : m.name.getText();
+                    const dartName = memberName.charAt(0).toLowerCase() + memberName.slice(1);
+                    return `  ${dartName}`;
+                });
+                const enumCode = `enum ${enumName} {\n${members.join(',\n')},\n}`;
+                return leadingComments ? `${leadingComments}\n${enumCode}` : enumCode;
+            }
+
             if (!ts.isVariableStatement(statement)) {
                 return null;
             }
@@ -458,7 +494,9 @@ export class FilePorter extends BaseTool {
                         : converted.text;
                 emitted.push(`const ${name} = ${withType};`);
             }
-            return emitted.length > 0 ? emitted.join('\n\n') : null;
+            if (emitted.length === 0) return null;
+            const body = emitted.join('\n\n');
+            return leadingComments ? `${leadingComments}\n${body}` : body;
         } catch {
             return null;
         }
@@ -477,9 +515,8 @@ export class FilePorter extends BaseTool {
                     const name = prop.name.text;
                     props.push(`'${name}': ${name}`);
                 } else if (ts.isSpreadAssignment(prop)) {
-                    const spread = this.convertDeterministicExpression(ts, prop.expression);
-                    if (!spread) return null;
-                    props.push(`...${spread.text}`);
+                    // Dart map literals do not support spread syntax — bail out to LLM
+                    return null;
                 } else {
                     return null;
                 }
@@ -597,7 +634,7 @@ ${portedCode}
         if (!raw || !raw.trim()) {
             return null;
         }
-        const trimmed = raw.trim();
+        const trimmed = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
         const block = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
         const candidate = (block ? block[1] : trimmed).trim();
         const start = candidate.indexOf('{');
@@ -757,6 +794,11 @@ ${portedCode}
             const trimmed = decl.trim();
             if (!trimmed) continue;
             if (/^\s*(import|export\s+\*)\b/.test(trimmed)) continue;
+            // Pass through comment-only blocks (e.g. file header comments) as-is
+            if (/^(\/\/[^\n]*(\n|$))+$/.test(trimmed)) {
+                outputUnits.push(trimmed);
+                continue;
+            }
 
             const deterministicDecl = await this.tryDeterministicDeclarationPort(trimmed, file.relativePath);
             if (deterministicDecl) {
@@ -894,6 +936,13 @@ ${portedCode}
             );
         }
 
+        // If the class has no callable members (only fields/properties), the skeleton
+        // already contains everything — skip member-by-member porting entirely.
+        if (decomposed.members.length === 0) {
+            const fullPort = this.stripImports(await engine.portDeclarationWithJson(file, classSource));
+            return fullPort.trim() || skeleton.trim();
+        }
+
         const envelope = this.extractClassEnvelope(skeleton, decomposed.className);
         if (!envelope) {
             if (useLargeClassOptimization) {
@@ -945,6 +994,9 @@ ${portedCode}
                 memberOutputs.push(converted.trim());
             }
         }
+
+        // Assemble: header from skeleton (which already contains ported fields),
+        // then callable member outputs, then footer.
         const assembled = `${envelope.header}\n${memberOutputs.join('\n\n')}\n${envelope.footer}`.trim();
         const sourceMethods = this.extractSourceClassMethodNames(classSource, decomposed.className);
         const missing = sourceMethods.filter(name => !this.dartClassHasMethod(assembled, name));
@@ -1126,15 +1178,18 @@ ${portedCode}
     }
 
     private parseSingleClassChunk(chunk: string): { name: string; header: string; body: string; prefix: string } | null {
-        const classMatch = chunk.match(/\bclass\s+([A-Za-z_]\w*)[^{]*\{/);
+        // Match optional Dart 3 modifiers before `class`, capturing the full start of the declaration
+        const classMatch = chunk.match(/(?:(?:abstract|interface|sealed|base|final|mixin)\s+)*class\s+([A-Za-z_]\w*)[^{]*\{/);
         if (!classMatch || classMatch.index === undefined) {
             return null;
         }
         const name = classMatch[1];
+        // classStart must include any leading modifiers (abstract, interface, etc.)
         const classStart = classMatch.index;
         const openBrace = chunk.indexOf('{', classStart);
-        const closeBrace = chunk.lastIndexOf('}');
-        if (openBrace < 0 || closeBrace <= openBrace) {
+        if (openBrace < 0) return null;
+        const closeBrace = this.findMatchingBrace(chunk, openBrace);
+        if (closeBrace < 0 || closeBrace <= openBrace) {
             return null;
         }
         const suffix = chunk.slice(closeBrace + 1).trim();
@@ -1426,7 +1481,7 @@ ${portedCode}
     private async decomposeClassDeclaration(
         classSource: string,
         filePath: string
-    ): Promise<{ className: string; members: string[] } | null> {
+    ): Promise<{ className: string; members: string[]; fieldBlock: string } | null> {
         try {
             const ts = await import('typescript');
             const sf = ts.createSourceFile(
@@ -1439,10 +1494,42 @@ ${portedCode}
             const cls = sf.statements.find((s: any) => ts.isClassDeclaration(s)) as any;
             if (!cls || !cls.name?.text) return null;
             const className = String(cls.name.text);
-            const members = cls.members
-                .map((m: any) => classSource.slice(m.getFullStart(), m.getEnd()).trim())
-                .filter((m: string) => m.length > 0);
-            return { className, members };
+
+            // Separate field-like members (properties, index signatures, semicolons)
+            // from callable members (constructors, methods, getters, setters).
+            // Fields are bundled into the skeleton and NOT ported individually —
+            // doing so causes type mismatches, duplicates, and context loss.
+            const fieldKinds = new Set([
+                ts.SyntaxKind.PropertyDeclaration,
+                ts.SyntaxKind.IndexSignature,
+                ts.SyntaxKind.SemicolonClassElement,
+            ]);
+            const callableKinds = new Set([
+                ts.SyntaxKind.Constructor,
+                ts.SyntaxKind.MethodDeclaration,
+                ts.SyntaxKind.GetAccessor,
+                ts.SyntaxKind.SetAccessor,
+            ]);
+
+            const fieldTexts: string[] = [];
+            const callableTexts: string[] = [];
+
+            for (const m of cls.members) {
+                const text = classSource.slice(m.getFullStart(), m.getEnd()).trim();
+                if (!text) continue;
+                if (fieldKinds.has(m.kind)) {
+                    fieldTexts.push(text);
+                } else if (callableKinds.has(m.kind)) {
+                    callableTexts.push(text);
+                }
+                // Unknown member kinds are silently skipped — they'll be in the skeleton
+            }
+
+            return {
+                className,
+                members: callableTexts,       // Only callables are ported individually
+                fieldBlock: fieldTexts.join('\n'),  // Fields stay in skeleton
+            };
         } catch {
             return null;
         }
@@ -1452,12 +1539,15 @@ ${portedCode}
         classText: string,
         className: string
     ): { header: string; footer: string } | null {
-        const re = new RegExp(`\\b(?:abstract\\s+)?class\\s+${className}\\b[^\\{]*\\{`, 'm');
+        const re = new RegExp(
+            `(?:(?:abstract|interface|sealed|base|final|mixin)\\s+)*class\\s+${className}\\b[^\\{]*\\{`,
+            'm'
+        );
         const m = re.exec(classText);
         if (!m || m.index === undefined) return null;
         const open = classText.indexOf('{', m.index);
         if (open < 0) return null;
-        const close = classText.lastIndexOf('}');
+        const close = this.findMatchingBrace(classText, open);
         if (close <= open) return null;
         const header = classText.slice(m.index, open + 1).trim();
         const footerRaw = classText.slice(close).trim();
@@ -1762,15 +1852,15 @@ ${portedCode}
                 break;
             }
 
+            // After dedup/repair, re-run finalize but skip mergeDuplicateClasses so we
+            // don't accidentally re-introduce duplicates via a bad merge.
             updated = engine.finalizeDartChunkedContent(updated, file);
             const nextIssues = engine.validateFinalChunkedOutput(updated, file.relativePath);
             if (nextIssues.length === 0) {
                 return { content: updated, issues: [] };
             }
-            if (nextIssues.join(' | ') === currentIssues.join(' | ')) {
-                currentIssues = nextIssues;
-                break;
-            }
+            // If same issues persist after a real change, try once more but then give up
+            // to avoid an infinite loop (the issue may be unfixable at this stage).
             currentIssues = nextIssues;
         }
 
@@ -1823,7 +1913,7 @@ ${portedCode}
         if (names.size === 0) return content;
         const removalRanges: Array<{ start: number; end: number }> = [];
         const seen = new Set<string>();
-        const declRegex = /^\s*(?:abstract\s+)?(class|enum|mixin|typedef)\s+([A-Za-z_]\w*)\b/gm;
+        const declRegex = /^\s*(?:(?:abstract|interface|sealed|base|final)\s+)*(class|enum|mixin|typedef)\s+([A-Za-z_]\w*)\b/gm;
         let match: RegExpExecArray | null;
 
         while ((match = declRegex.exec(content)) !== null) {

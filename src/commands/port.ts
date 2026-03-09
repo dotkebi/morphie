@@ -54,6 +54,7 @@ interface PortOptions {
   concurrency?: string;
   autoConcurrency?: boolean;
   testMode?: string;
+  subdir?: string;
 }
 
 type TestMode = 'skip' | 'only';
@@ -289,7 +290,7 @@ export async function portProject(
     const reviewerBaseUrl = options.reviewerBaseUrl
       ?? options.baseUrl
       ?? getDefaultBaseUrl(reviewerProvider, options.ollamaUrl);
-    const reviewerModel = options.reviewerModel?.trim() || 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit';
+    const reviewerModel = options.reviewerModel?.trim() || 'qwen3.5-122b-a10b';
     const reviewerApiKey = options.reviewerApiKey ?? options.apiKey;
     process.env.MORPHIE_REVIEWER_MODEL = reviewerModel;
     process.env.MORPHIE_REVIEWER_PROVIDER = reviewerProvider;
@@ -394,6 +395,7 @@ export async function portProject(
         concurrency: parsePositiveInt(options.concurrency, 2),
         autoConcurrency: options.autoConcurrency,
         testMode,
+        subdir: options.subdir,
       });
 
       if (result.success) {
@@ -482,7 +484,9 @@ export async function portProject(
     spinner.stop();
 
     const selectedFiles = orderFilesForPorting(
-      selectFilesByTestMode(analysis.files, testMode),
+      selectFilesByTestMode(analysis.files, testMode).filter(f =>
+        !options.subdir || f.relativePath.startsWith(options.subdir)
+      ),
       options.from,
       options.to,
       analysis.dependencyGraph

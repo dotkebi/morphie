@@ -32,6 +32,7 @@ import type {
     QualityIssue,
 } from '../types/agent-types.js';
 import type { ProjectAnalysis } from './analyzer.js';
+import type { PortingEngine } from './porting-engine.js';
 
 class AdaptiveSemaphore {
     private limit: number;
@@ -103,6 +104,7 @@ export class AgentOrchestrator {
     private refineAttempts = 0;
     private lastPortedFiles?: PortedFile[];
     private lastEmptyResponseFiles?: string[];
+    private lastConstObjectWarnings?: string[];
 
     constructor(
         llm: LLMClient,
@@ -462,6 +464,7 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
                         await this.writeImportReport(task, portedFiles);
                     }
                     await this.writeEmptyResponseReport(task);
+                    await this.writeConstObjectWarningsReport(task);
                     break;
 
                 case 'Verification':
@@ -587,7 +590,9 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         const completed = new Set(this.session?.completedFiles ?? []);
         const fileHashes = this.session?.fileHashes ?? {};
         const testMode = (task.testMode ?? 'skip') as TestMode;
-        const baseFiles = this.selectFilesByTestMode(projectAnalysis.files, testMode);
+        const baseFiles = this.selectFilesByTestMode(projectAnalysis.files, testMode).filter(f =>
+            !task.subdir || f.relativePath.startsWith(task.subdir)
+        );
         const orderedBaseFiles = orderFilesForPorting(
             baseFiles,
             task.sourceLanguage,
@@ -632,111 +637,12 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
                     this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== file.relativePath);
                     await this.sessionManager.save(this.sessionPath, this.session);
                 }
-                const result = await filePorter.execute({
-                    file,
-                    sourceLanguage: task.sourceLanguage,
-                    targetLanguage: task.targetLanguage,
-                    projectName: task.targetPath.split('/').pop() || 'project',
-                    targetPath: task.targetPath,
-                    allFiles: projectAnalysis.files,
-                    apiSnapshot,
-                    verbose: this.verbose,
-                });
 
-                if (result.success && result.output?.file) {
-                    const ported = result.output.file;
-                    portedFiles.push({
-                        originalPath: ported.originalPath,
-                        targetPath: ported.targetPath,
-                        content: ported.content,
-                        sourceLanguage: task.sourceLanguage,
-                        targetLanguage: task.targetLanguage,
-                        metadata: ported.metadata,
-                    });
-
-                    if (!task.dryRun) {
-                        await this.fs.writeFile(
-                            `${task.targetPath}/${ported.targetPath}`,
-                            ported.content
-                        );
-                    }
-
-                    this.log(`  ${progress} ✓ ${file.relativePath} → ${ported.targetPath}`);
-
-                    if (ported.metadata?.importIssues?.length) {
-                        errors.push({
-                            file: ported.targetPath,
-                            type: 'import',
-                            message: `Import validation failed: ${ported.metadata.importIssues.join('; ')}`,
-                            recoverable: true,
-                        });
-                    }
-
-                    if (this.session && this.sessionPath) {
-                        completed.add(file.relativePath);
-                        fileHashes[file.relativePath] = contentHash;
-                        this.session.completedFiles = Array.from(completed);
-                        this.session.fileHashes = fileHashes;
-                        this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== file.relativePath);
-                        this.session.phase = 'porting';
-                        await this.sessionManager.save(this.sessionPath, this.session);
-                    }
-                } else {
-                    errors.push({
-                        file: file.relativePath,
-                        type: 'unknown',
-                        message: result.error || 'Unknown error',
-                        recoverable: true,
-                    });
-                    this.log(`  ${progress} ✗ Failed: ${file.relativePath}`);
-                    if (this.session && this.sessionPath) {
-                        this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== file.relativePath);
-                        this.session.failedFiles.push({
-                            file: file.relativePath,
-                            error: result.error || 'Unknown error',
-                        });
-                        this.session.phase = 'porting';
-                        await this.sessionManager.save(this.sessionPath, this.session);
-                    }
-
-                    if ((result.error || '').includes('Empty response from LLM')) {
-                        if (!this.lastEmptyResponseFiles) {
-                            this.lastEmptyResponseFiles = [];
-                        }
-                        this.lastEmptyResponseFiles.push(file.relativePath);
-                        if (autoConcurrency && semaphore.getLimit() > 1) {
-                            semaphore.setLimit(semaphore.getLimit() - 1);
-                        }
-                    }
-                }
-            } catch (error) {
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                errors.push({
-                    file: file.relativePath,
-                    type: 'unknown',
-                    message: errorMessage,
-                    recoverable: false,
-                });
-                this.log(`  ${progress} ✗ Error: ${file.relativePath}`);
-                if (this.session && this.sessionPath) {
-                    this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== file.relativePath);
-                    this.session.failedFiles.push({
-                        file: file.relativePath,
-                        error: errorMessage,
-                    });
-                    this.session.phase = 'porting';
-                    await this.sessionManager.save(this.sessionPath, this.session);
-                }
-
-                if (errorMessage.includes('Empty response from LLM')) {
-                    if (!this.lastEmptyResponseFiles) {
-                        this.lastEmptyResponseFiles = [];
-                    }
-                    this.lastEmptyResponseFiles.push(file.relativePath);
-                    if (autoConcurrency && semaphore.getLimit() > 1) {
-                        semaphore.setLimit(semaphore.getLimit() - 1);
-                    }
-                }
+                await this.portFilesInParallel(
+                    file, task, projectAnalysis.files, apiSnapshot,
+                    portedFiles, errors, completed, fileHashes,
+                    contentHash, progress, autoConcurrency, semaphore
+                );
             } finally {
                 processed += 1;
                 semaphore.release();
@@ -783,6 +689,9 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         } else {
             this.lastImportIssueFiles = undefined;
         }
+
+        const allWarnings = portedFiles.flatMap(file => file.metadata?.constObjectWarnings ?? []);
+        this.lastConstObjectWarnings = allWarnings.length > 0 ? allWarnings : undefined;
         return {
             filesProcessed: portedFiles.length,
             files: portedFiles,
@@ -790,10 +699,132 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         };
     }
 
+    private async portFilesInParallel(
+        file: SourceFile,
+        task: PortingTask,
+        allFiles: SourceFile[],
+        apiSnapshot: string,
+        portedFiles: PortedFile[],
+        errors: PortingError[],
+        completed: Set<string>,
+        fileHashes: Record<string, string>,
+        contentHash: string,
+        progress: string,
+        autoConcurrency: boolean,
+        semaphore: AdaptiveSemaphore
+    ): Promise<void> {
+        const filePorter = this.toolRegistry.get('file-porter') as FilePorter;
+        try {
+            const result = await filePorter.execute({
+                file,
+                sourceLanguage: task.sourceLanguage,
+                targetLanguage: task.targetLanguage,
+                projectName: task.targetPath.split('/').pop() || 'project',
+                targetPath: task.targetPath,
+                allFiles,
+                apiSnapshot,
+                verbose: this.verbose,
+            });
+
+            if (result.success && result.output?.file) {
+                const ported = result.output.file;
+                portedFiles.push({
+                    originalPath: ported.originalPath,
+                    targetPath: ported.targetPath,
+                    content: ported.content,
+                    sourceLanguage: task.sourceLanguage,
+                    targetLanguage: task.targetLanguage,
+                    metadata: ported.metadata,
+                });
+
+                if (!task.dryRun) {
+                    await this.fs.writeFile(`${task.targetPath}/${ported.targetPath}`, ported.content);
+                }
+
+                this.log(`  ${progress} ✓ ${file.relativePath} → ${ported.targetPath}`);
+
+                if (ported.metadata?.importIssues?.length) {
+                    this.recordPortingError(errors, {
+                        file: ported.targetPath,
+                        type: 'import',
+                        message: `Import validation failed: ${ported.metadata.importIssues.join('; ')}`,
+                        recoverable: true,
+                    });
+                }
+
+                await this.saveFileProgress(file.relativePath, contentHash, completed, fileHashes);
+            } else {
+                this.log(`  ${progress} ✗ Failed: ${file.relativePath}`);
+                const errorMessage = result.error || 'Unknown error';
+                this.recordPortingError(errors, {
+                    file: file.relativePath,
+                    type: 'unknown',
+                    message: errorMessage,
+                    recoverable: true,
+                });
+                await this.saveFileProgress(file.relativePath, null, completed, fileHashes, errorMessage);
+
+                if (errorMessage.includes('Empty response from LLM')) {
+                    if (!this.lastEmptyResponseFiles) this.lastEmptyResponseFiles = [];
+                    this.lastEmptyResponseFiles.push(file.relativePath);
+                    if (autoConcurrency && semaphore.getLimit() > 1) {
+                        semaphore.setLimit(semaphore.getLimit() - 1);
+                    }
+                }
+            }
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this.log(`  ${progress} ✗ Error: ${file.relativePath}`);
+            this.recordPortingError(errors, {
+                file: file.relativePath,
+                type: 'unknown',
+                message: errorMessage,
+                recoverable: false,
+            });
+            await this.saveFileProgress(file.relativePath, null, completed, fileHashes, errorMessage);
+
+            if (errorMessage.includes('Empty response from LLM')) {
+                if (!this.lastEmptyResponseFiles) this.lastEmptyResponseFiles = [];
+                this.lastEmptyResponseFiles.push(file.relativePath);
+                if (autoConcurrency && semaphore.getLimit() > 1) {
+                    semaphore.setLimit(semaphore.getLimit() - 1);
+                }
+            }
+        }
+    }
+
+    private async saveFileProgress(
+        relativePath: string,
+        contentHash: string | null,
+        completed: Set<string>,
+        fileHashes: Record<string, string>,
+        failureError?: string
+    ): Promise<void> {
+        if (!this.session || !this.sessionPath) return;
+
+        this.session.failedFiles = this.session.failedFiles.filter(item => item.file !== relativePath);
+
+        if (contentHash !== null) {
+            completed.add(relativePath);
+            fileHashes[relativePath] = contentHash;
+            this.session.completedFiles = Array.from(completed);
+            this.session.fileHashes = fileHashes;
+        } else if (failureError !== undefined) {
+            this.session.failedFiles.push({ file: relativePath, error: failureError });
+        }
+
+        this.session.phase = 'porting';
+        await this.sessionManager.save(this.sessionPath, this.session);
+    }
+
+    private recordPortingError(errors: PortingError[], error: PortingError): void {
+        errors.push(error);
+    }
+
     private async recoverFailedFilesWithPostProcess(
         task: PortingTask,
         sourceFiles: SourceFile[],
-        engine: any,
+        engine: PortingEngine,
         errors: PortingError[],
         completed: Set<string>,
         fileHashes: Record<string, string>
@@ -874,7 +905,7 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
     private async recoverFailedFilesByRePorting(
         task: PortingTask,
         sourceFiles: SourceFile[],
-        engine: any,
+        engine: PortingEngine,
         filePorter: FilePorter,
         errors: PortingError[],
         completed: Set<string>,
@@ -1456,6 +1487,54 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
         await this.fs.writeFile(markdownPath, markdownLines.join('\n'));
     }
 
+    private async writeConstObjectWarningsReport(task: PortingTask): Promise<void> {
+        if (task.dryRun || !this.lastConstObjectWarnings || this.lastConstObjectWarnings.length === 0) {
+            return;
+        }
+
+        const reportPath = `${task.targetPath}/morphie-const-object-warnings.txt`;
+        const markdownPath = `${task.targetPath}/morphie-const-object-warnings.md`;
+
+        const lines = [
+            'Files requiring manual const object conversion:',
+            '',
+            ...this.lastConstObjectWarnings.map(w => `- ${w}`),
+            '',
+            'These files contain top-level `const Foo = { ... }` patterns that are invalid Dart.',
+            'Each must be converted to a Dart class + const instance. See PromptBuilder rule #2.',
+        ];
+
+        const markdownLines = [
+            '# Morphie: Const Object Warnings',
+            '',
+            'The following files contain top-level `const Foo = { ... }` patterns that are **invalid Dart**.',
+            'Each file must be manually converted to a Dart class + const instance.',
+            '',
+            '## Affected Files',
+            '',
+            ...this.lastConstObjectWarnings.map(w => `- \`${w}\``),
+            '',
+            '## How to Fix',
+            '',
+            'Convert `export const Foo = { key: value, nested: { ... } }` to:',
+            '',
+            '```dart',
+            'class _NestedData {',
+            '  final int key;',
+            '  const _NestedData({required this.key});',
+            '}',
+            'class _FooData {',
+            '  final _NestedData nested;',
+            '  const _FooData({required this.nested});',
+            '}',
+            'const Foo = _FooData(nested: _NestedData(key: value));',
+            '```',
+        ];
+
+        await this.fs.writeFile(reportPath, lines.join('\n'));
+        await this.fs.writeFile(markdownPath, markdownLines.join('\n'));
+    }
+
     private buildImportReport(
         issues: Array<{ file: string; issues: string[]; required: string[]; actual: string[] }>
     ): string {
@@ -1566,7 +1645,7 @@ Respond with ONLY a valid JSON object. Do not include any explanations, preamble
     /**
      * Extract JSON from LLM response
      */
-    private extractJSON(response: string): any {
+    private extractJSON(response: string): TaskUnderstanding {
         // Try to find all potential JSON blocks (using balanced braces)
         const blocks: string[] = [];
         let braceCount = 0;

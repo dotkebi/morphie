@@ -24,7 +24,7 @@ describe('AgentOrchestrator', () => {
         it('should have a tool registry', () => {
             const registry = orchestrator.getToolRegistry();
             expect(registry).toBeDefined();
-            expect(registry.size).toBe(0); // No tools registered yet
+            expect(registry.size).toBe(4);
         });
 
         it('should have a conversation manager', () => {

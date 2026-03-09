@@ -21,13 +21,13 @@ program
   .requiredOption('-t, --to <language>', 'Target language (e.g., rust, typescript, java)')
   .option(
     '-m, --model <model>',
-    'LLM model to use (default: mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit)',
-    'mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit'
+    'LLM model to use (default: qwen3.5-122b-a10b)',
+    'qwen3.5-122b-a10b'
   )
   .option('--provider <provider>', 'LLM provider: ollama|openai|mlx|lmstudio', 'lmstudio')
   .option('--base-url <url>', 'LLM API base URL (overrides --ollama-url if set)')
   .option('--api-key <key>', 'API key for OpenAI-compatible providers')
-  .option('--reviewer-model <model>', 'Reviewer model for failure-retry stage (default: mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit)')
+  .option('--reviewer-model <model>', 'Reviewer model for failure-retry stage (default: qwen3.5-122b-a10b)')
   .option('--reviewer-provider <provider>', 'Reviewer provider: ollama|openai|mlx|lmstudio (defaults to --provider)')
   .option('--reviewer-base-url <url>', 'Reviewer API base URL (defaults to --base-url/--ollama-url)')
   .option('--reviewer-api-key <key>', 'API key for reviewer provider (defaults to --api-key)')
@@ -52,6 +52,7 @@ program
   .option('--concurrency <count>', 'Number of files to port in parallel', '2')
   .option('--no-auto-concurrency', 'Disable adaptive concurrency')
   .option('--test-mode <mode>', 'How to port test files: skip|only', 'skip')
+  .option('--subdir <path>', 'Only port files under this subdirectory (relative to source root)')
   .action(portProject);
 
 program

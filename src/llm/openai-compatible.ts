@@ -1,5 +1,12 @@
 import type { GenerateOptions, LLMClient, LLMModel } from './types.js';
 
+interface OpenAIChatCompletionChunk {
+  choices?: Array<{
+    delta?: { content?: string };
+    finish_reason?: string | null;
+  }>;
+}
+
 interface OpenAIChatCompletionResponse {
   choices?: Array<{
     message?: { content?: string };
@@ -62,52 +69,98 @@ export class OpenAICompatibleClient implements LLMClient {
     const opts = { ...this.defaultOptions, ...options };
     const startedAt = Date.now();
     const verbose = options?.verbose === true;
-    const timeoutMs = opts.timeoutMs ?? 0;
-    const controller = timeoutMs > 0 ? new AbortController() : undefined;
-    const timeoutHandle = timeoutMs > 0
-      ? setTimeout(() => controller?.abort(), timeoutMs)
-      : undefined;
+    // timeoutMs now applies to first-token latency only (via AbortController reset after first chunk)
+    const firstTokenTimeoutMs = opts.timeoutMs ?? 0;
+    const controller = new AbortController();
+    let firstTokenReceived = false;
+    let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+
+    if (firstTokenTimeoutMs > 0) {
+      firstTokenTimer = setTimeout(() => {
+        if (!firstTokenReceived) controller.abort();
+      }, firstTokenTimeoutMs);
+    }
+
     let response: Response;
     try {
       response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: this.headers(),
-        signal: controller?.signal,
+        signal: controller.signal,
         body: JSON.stringify({
           model: this.model,
           messages: [{ role: 'user', content: prompt }],
           temperature: opts.temperature,
           top_p: opts.topP,
           max_tokens: opts.maxTokens,
-          stream: false,
+          stream: true,
         }),
       });
     } catch (error) {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      if (timeoutMs > 0) {
-        throw new Error(`LLM request timed out after ${timeoutMs}ms`);
+      if (firstTokenTimer) clearTimeout(firstTokenTimer);
+      if (!firstTokenReceived && firstTokenTimeoutMs > 0) {
+        throw new Error(`LLM request timed out after ${firstTokenTimeoutMs}ms`);
       }
       throw error;
-    } finally {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
     }
 
     if (!response.ok) {
+      if (firstTokenTimer) clearTimeout(firstTokenTimer);
       const error = await response.text();
       if (verbose) {
-        const elapsedMs = Date.now() - startedAt;
-        console.log(`[OpenAI Debug] Response time (failed): ${elapsedMs}ms`);
+        console.log(`[OpenAI Debug] Response time (failed): ${Date.now() - startedAt}ms`);
       }
       throw new Error(`OpenAI-compatible generation failed: ${error}`);
     }
 
-    const data = await response.json() as OpenAIChatCompletionResponse;
-    const content = data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? '';
-    if (verbose) {
-      const elapsedMs = Date.now() - startedAt;
-      console.log(`[OpenAI Debug] Response time: ${elapsedMs}ms`);
+    // Read SSE stream
+    const reader = response.body?.getReader();
+    if (!reader) {
+      if (firstTokenTimer) clearTimeout(firstTokenTimer);
+      throw new Error('No response body');
     }
-    return content;
+
+    const decoder = new TextDecoder();
+    let fullContent = '';
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        if (!firstTokenReceived) {
+          firstTokenReceived = true;
+          if (firstTokenTimer) clearTimeout(firstTokenTimer);
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === 'data: [DONE]') continue;
+          if (!trimmed.startsWith('data: ')) continue;
+          try {
+            const chunk = JSON.parse(trimmed.slice(6)) as OpenAIChatCompletionChunk;
+            const token = chunk.choices?.[0]?.delta?.content ?? '';
+            if (token) fullContent += token;
+          } catch {
+            // malformed chunk — skip
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+      if (firstTokenTimer) clearTimeout(firstTokenTimer);
+    }
+
+    if (verbose) {
+      console.log(`[OpenAI Debug] Response time: ${Date.now() - startedAt}ms`);
+    }
+
+    return fullContent;
   }
 
   async generateStream(
@@ -115,10 +168,9 @@ export class OpenAICompatibleClient implements LLMClient {
     onToken: (token: string) => void,
     options?: GenerateOptions
   ): Promise<string> {
+    // generateStream now leverages the streaming generate() and calls onToken with full result
     const content = await this.generate(prompt, options);
-    if (content) {
-      onToken(content);
-    }
+    if (content) onToken(content);
     return content;
   }
 

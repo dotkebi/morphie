@@ -31,6 +31,7 @@ export interface PortingTask {
   concurrency?: number;
   autoConcurrency?: boolean;
   testMode?: 'skip' | 'only';
+  subdir?: string;
 }
 
 export interface TaskUnderstanding {
@@ -109,15 +110,13 @@ export interface PortedFile {
   originalPath: string;
   targetPath: string;
   content: string;
-  sourceLanguage: string;
-  targetLanguage: string;
+  sourceLanguage?: string;
+  targetLanguage?: string;
   metadata?: {
-    linesOfCode: number;
-    complexity: number;
-    dependencies: string[];
     importIssues?: string[];
     requiredImports?: string[];
     actualImports?: string[];
+    constObjectWarnings?: string[];
   };
 }
 
